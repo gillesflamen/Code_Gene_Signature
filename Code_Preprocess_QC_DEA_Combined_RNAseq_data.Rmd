@@ -1,0 +1,1006 @@
+---
+title: "Analysis of Gou et al. data and COmbined data (with internal)"
+author: "Gilles Flamen"
+date: "`r format(Sys.time(), '%d %b %Y')`"
+output: 
+  BiocStyle::html_document: 
+    theme: spacelab 
+    number_sections: yes 
+    toc_float: yes 
+    toc_depth: 3
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+
+h1.title { 
+  text-align: center; 
+  margin-top: 60px; 
+  margin-bottom: 30px;
+}
+
+img + em { 
+  display: inherit; 
+  text-align: center; 
+  font-size: 8pt; 
+  color: #1a81c2; 
+  font-style: inherit; 
+  font-weight: bold; 
+}
+
+</style>
+```
+
+------------------------------------------------------------------------
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Conclusions: 
+
+We performed two DESeq2 analysis on two different models. 
+First model: response + metastasis + PAM50 
+Second model: response + patientID
+
+We couldn't add both the variables and the patientID, so we had to do the analyses separatly.
+
+Different results were obtained with both models, where those of the first model are in line with the results from the analysis done on the Gou data. Which makes sense as well since the same variables were included in the model. 
+Nevertheless, these results are not really interesting and not straightforward associable with the biological context. 
+
+Conversely, the results obtained with the second model (only patientID) are more in line with those after DESeq2 analysis of Laia's data. Where as well only the patient ID was added to the model. But, the results are logical considering our biological context. 
+
+Depending on adding certain variables to the model when doing DESeq2 on the combined data, the results are more shifted to one dataset. I'm having more trust in the model with only patientID added, since it looks biologically most significant to me to add patientID to account for the patient variability. Also the lasso didn't point out any significant variables. And, the results are more context-associated when only adding patientID.
+
+I would continue with the combined data set to construct the model and use the pseudobulk data set (from the single-cell analysis) as validation set. 
+
+One question: we should be aware of the biological context of the expression data. Does it also include immune cells? Since the mice were immuno-deprived. 
+
+Depending on this we could filter out the single-cell data set so that we are only left with cancer cells?
+
+
+
+
+# Libraries 
+
+```{r load libraries, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+# images
+library(magick)
+
+# General
+library(dendextend)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(matrixStats)
+
+# Stats
+library(DESeq2)
+library(sva)
+library(limma)
+library(sva)
+
+# plotting
+library("pheatmap")
+library("RColorBrewer")
+library(ggplot2)
+library(ggrepel)
+
+# Clustering
+library(PoiClaClu)
+
+# functional analysis
+library(tidyverse)
+
+library(org.Hs.eg.db)
+library(msigdbr)
+library(annotate)
+
+library(clusterProfiler)
+library(enrichplot)
+```
+
+# Main data
+
+Retrieve Laia's data. This is already as a DESeq2 object. As well, the sample data from previous data. 
+
+```{r load Laia data}
+# set seed, clustering differs each run
+set.seed(123)
+
+setwd("C:/Users/flame/OneDrive/BARCELONA/VHIO")
+rm(list = ls ())
+# load data
+#load("deseq2.dds.RData")
+
+# Or this is the normalized filtered data that gave, for me, the most reliable results
+load("ddsF.RData")
+# head(counts(ddsF))
+
+# sample data
+sample.info <- as.data.frame(read_xlsx("230508 Analysis_RNAseq_hormoneresponse_V4.xlsx"))
+```
+
+# Gou data
+## Sample
+
+Load the Gou sample data, had to construct it manually from the figures in the article. Only selected the E2_plus samples, suppressed samples were eliminated, and independent and partial dependent samples were combined as resistant. 
+
+```{r Gou sample}
+
+gou.info <- data.frame(sample = c("BCM-15034", "BCM-15034", "BCM-15100", "BCM-15100", "BCM-3277", "BCM-3277", "HC1-013E1", "HCI.013E1", "WHIM16", "WHIM16", "WHIM18", "WHIM18", "WHIM20", "WHIM20", "WHIM24", "WHIM24", "WHIM27", "WHIM27", "WHIM43", "WHIM43", "WHIM40", "WHIM40", "BCM-15131", "BCM-15131", "BCM-7441", "BCM-7441", "HCI-005", "HCI-005", "WHIM37", "WHIM37", "WHIM9", "WHIM9", "BCM-15057", "BCM-15057", "BCM-4888", "BCM-4888", "HCI-003", "HCI-003", "HCI-007", "HCI-007", "HCI-011", "HCI-011", "HCI-013", "HCI-013"))
+gou.info$sample <- paste(gou.info$sample, "plusE2",sep= "_")
+gou.info$E2_dependency <- rep(c("independent", "suppresed", "partial_dependent", "dependent"), c(20,2,10,12))
+gou.info$PAM50 <- rep(c("Her2","B","Basal","B","Her2","Basal","B","A","B","A","Her2","B", "A", "B"), c(1,3,2,16,2,2,6,1,1,1,1,6,1,1))
+gou.info$metastatic <- rep(c("Metastatic","Primary","Metastatic","Primary","Metastatic","Primary","Metastatic"), c(4,2,16,4,6,6,6))
+
+# take only the plus_E2 samples
+sample.gou <- gou.info[seq(2,44,2),]
+
+# remove "suppresed" samples
+sample.gou <- sample.gou[sample.gou$E2_dependency!="suppresed",]
+
+
+# aggregate independent and partial_Depedent as resistant
+sample.gou$response <- ifelse(sample.gou$E2_dependency %in% c("independent", "partial_dependent"), "Resistant", "Sensitive")
+
+sample.gou
+```
+
+## RSEM counts
+
+Load the raw RSEM counts. Compare ranges of gene expression with Laia's data. We observe that the Gou raw data is log2(x + 1) transformed. This must be inversed before fusing the data sets. 
+
+```{r load RSEM raw counts from Gou et al}
+
+# Normalized count data
+gou.raw.data <- read.table("ERPDX_RNAseq_Log2_RSEM_counts_v4.0.txt", header = TRUE)
+
+row.names(gou.raw.data) <- gou.raw.data[,1]
+
+gou.raw.data <- gou.raw.data[,-1]
+
+head(gou.raw.data, n = 3)
+
+range(gou.raw.data) # this are raw RSEM count data, the method that accounts for multimapped reads through statistical models, that why no integers but fractional numbers. 
+
+dim(gou.raw.data)
+
+# Laia data raw
+laia.raw.data <- counts(ddsF)
+range(laia.raw.data) # this is in milions, gou is log(x+1)
+
+```
+
+# Explore Gou data 
+
+Explore the Gou data, check distributions, clustering, PCA...
+Select only E2_plus samples in the expression data, order the sample data so that in the same order as the expression data.
+
+```{r explore Gou data}
+
+gou.raw.data <- gou.raw.data[,seq(2,44,2)]
+
+# exclude the suppressed sample 
+gou.raw.data <- gou.raw.data[,-20]
+
+
+dim(gou.raw.data)
+dim(counts(ddsF))
+
+# Order the samples so that they are in the same order as the expression data columns  
+sample.gou <- sample.gou[order(sample.gou$sample),]
+
+```
+
+## PCA
+
+```{r PCA gou.data, warning=F, error=F, message=F}
+gou.matrix <- as.matrix(gou.raw.data)
+
+gou.matrix <- ifelse(gou.matrix=="NA", NA, as.numeric(gou.matrix))
+
+class(gou.matrix)
+
+pca.filt <- prcomp(t(na.omit(gou.matrix)),scale. = F)
+summary(pca.filt)$importance[,c(1:3)]
+
+## Scores data
+scores2 <- data.frame(pca.filt$x[, c("PC1", "PC2")])
+scores2$class <- sample.gou$response
+
+scoresplot <- ggplot(data = scores2, aes(x = PC1, y = PC2, colour = class)) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste("PC1 (", round(summary(pca.filt)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste("PC2 (", round(summary(pca.filt)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + 
+  theme_bw()
+scoresplot
+
+
+```
+
+## Clustering samples 
+
+```{r hierarchial clustering GOU amples 1}
+
+# Perform hierarchical clustering on gene expression matrix
+
+hc <- hclust(dist(t(gou.matrix)), method = "ward.D2")
+
+hc.average <- hclust(dist(t(gou.matrix)), method = "average")
+
+hc.max <- hclust(dist(t(gou.matrix)), method = "complete")
+
+# Plot the dendrogram with colored labels
+sample_colors <- ifelse(sample.gou$response == "Sensitive", "blue","red")
+
+dend <- as.dendrogram(hc)
+sample_colors <- sample_colors[order.dendrogram(dend)]
+labels_colors(dend) <- sample_colors
+labels_cex(dend) <- 0.8
+plot(dend, main = "Dendrogram: ward.d2 of normalized expression data")
+legend("topright", 
+     legend = c("Resistant","Sensitive"), 
+     col = c("red", "blue"), 
+     pch = c(20,20), bty = "n",  pt.cex = 1.5, cex = 0.8 , 
+     text.col = "black", horiz = FALSE, inset = c(0, 0.1))
+
+```
+
+## Distribution expr
+
+```{r expression distribution Gou data 1, warning=F}
+
+
+# Convert the data frame to a tibble for easier manipulation (if needed)
+gou.data_tibble <- as_tibble(gou.matrix)
+dim(gou.matrix)
+rownames(gou.data_tibble) <- rownames(gou.raw.data)
+# Add row names as a column
+plot_data <- gou.data_tibble %>%
+  rownames_to_column(var = "Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "sample", values_to = "Expression")
+
+plot_data$response <- rep(sample.gou$response, 19257)
+
+# Plot the expression distribution
+ggplot(plot_data, aes(x = sample, y = Expression, fill = response)) +
+  geom_boxplot(color = "black") +
+  labs(x = "Sample", y = "Expression") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+This is the general distribution of the Gou data, when expressed in raw counts log(x+1)-transformed! 
+
+We can see that the HCI-samples are all showing lower expression than the rest, keep in mind, this pattern will come back later. 
+
+Lets also do a TMM on the raw counts, and redo the distribution plots. 
+
+```{r}
+library(edgeR)
+
+# inverse log(x+1) & round
+gou.raw.data.plot <- round((2^gou.raw.data)-1)
+
+colnames(gou.raw.data.plot) <- sample.gou$sample
+
+# Create a DGEList object
+gou.dge <- DGEList(counts = gou.raw.data.plot)
+
+# Perform TMM normalization
+gou.dge <- calcNormFactors(gou.dge, method = "TMM")
+
+# extract normalized reads
+gou.raw.norm <- cpm(gou.dge)
+
+gou.raw.norm <- log(gou.raw.norm+1)
+
+# plot distributions
+# Convert the data frame to a tibble for easier manipulation (if needed)
+gou.data.raw_tibble <- as_tibble(gou.raw.norm)
+
+rownames(gou.data.raw_tibble) <- rownames(gou.raw.norm)
+
+# Add row names as a column
+plot_data <- gou.data.raw_tibble %>%
+  rownames_to_column(var = "Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "sample", values_to = "Expression")
+
+plot_data$response <- rep(sample.gou$response, 19257)
+
+# Plot the expression distribution
+ggplot(plot_data, aes(x = sample, y = Expression, fill = response)) +
+  geom_boxplot(color = "black") +
+  labs(x = "Sample", y = "Expression") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+When TMM of the Gou raw data (and then log(x+1)) the distributions are very similar across the samples. 
+
+
+# Analysis Gou data
+## DESeq2
+
+For the DESeq2 analysis we must inverse the log(x+1) counts and round the values so that they are back in the raw counts form. 
+
+```{r inverse data to raw counts}
+# inverse log(x+1) & round
+gou.raw.data <- round((2^gou.raw.data)-1)
+```
+
+
+```{r DESeq2 Gou, eval= F}
+# Add design formula to dds object
+design.deseq.gou <- model.matrix(~0+sample.gou$response+sample.gou$PAM50+sample.gou$metastatic)
+rownames(design.deseq.gou) <- sample.gou$sample
+colnames(design.deseq.gou) <- gsub("sample.gou\\$", "", colnames(design.deseq.gou))
+colnames(design.deseq.gou) <- gsub("response", "", colnames(design.deseq.gou))
+
+design.deseq.gou
+
+rownames(sample.gou) <- sample.gou$sample
+colnames(gou.raw.data) <- sample.gou$sample
+
+dds.gou <- DESeqDataSetFromMatrix(countData = as.matrix(gou.raw.data),colData = sample.gou,design= design.deseq.gou)
+
+# perform DESeq2 
+dds.gou <- DESeq(dds.gou)
+
+
+# Contrasts: resistant vs. sensitive
+# we annotated Resistant as 1, and Sensitive as -1 
+# up-regulated genes will be over-expressed in Resistant Samples
+res.gou <- results(dds.gou, contrast=c(1,-1,0,0,0), alpha = 0.05)
+summary(res.gou)
+# here we have +1300 DEG
+
+res.gou.DF <- as.data.frame(res.gou)
+res.gou.DF <- res.gou.DF[order(res.gou.DF$pvalue),]
+res.gou.DFSign <- res.gou.DF[!is.na(res.gou.DF$pvalue) & res.gou.DF$padj<0.05 & abs(res.gou.DF$log2FoldChange) > 1, ] # 561 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res.gou.DFSign <- res.gou.DFSign[!is.na(res.gou.DFSign$baseMean),]
+
+# here we have +1100 DEG
+
+# Lets show the top 100 DEG
+res.gou.DFSign[1:100,]
+
+# lets plot histogram of pvalues
+hist(res.gou.DFSign$pvalue, 100)
+
+```
+When dont add the clinical variables the resulting list of DEGs is not enriched in any Hallmark, and the enriched C2-terms are not associatable with the biological context. 
+
+Nevertheless, when we also account for the variables PAM50 and metastasis status in the model when doing the DESeq2 analysis, the enriched Hallmarks: E2F, MYC targets, and G2M ... show up that are all downstream targets from ER-signalling, and cancer associatable. 
+
+Although adding the clinical variables gives better results when doing the analysis on the Gou data only, I don't feel like adding them as well for the combined data since they give problems during the DESeq2 analysis, and Lasso pointed out no added value of including them in the model. 
+
+For the Limma analysis on the normalized reads from Gou see the other report: CombiningNewData.Rmd
+
+## functional analysis
+
+Construct the Hallmark & C2-term sets 
+
+```{r construct H & C2 sets, eval = F}
+
+# Hallmark
+H <- msigdbr(species = "Homo sapiens", category = "H")
+
+H.entrez <- H %>% dplyr::select(gs_name, entrez_gene)
+H.symbol <- H %>% dplyr::select(gs_name, gene_symbol)
+dim(table(H$gs_name))
+
+# C2
+C2<- msigdbr(species = "Homo sapiens", category = "C2")
+
+C2.entrez <- C2 %>% dplyr::select(gs_name, entrez_gene)
+C2.symbol <- C2 %>% dplyr::select(gs_name, gene_symbol)
+
+
+```
+
+Do the enrichments
+
+```{r, eval = F}
+genes.gou <- rownames(res.gou.DFSign)
+
+ids.gou <- mapIds(org.Hs.eg.db, genes.gou, "ENTREZID", "SYMBOL")
+
+em.gou <- enricher(ids.gou, TERM2GENE=H.entrez)
+em.gou
+barplot(em.gou)
+
+em.c.gou <- enricher(ids.gou, TERM2GENE = C2.entrez)
+em.c.gou
+data.frame(em.c.gou)$ID[1:30]
+
+barplot(em.c.gou)
+
+```
+
+We do see one context-associated term: 
+"DUTERTRE_ESTRADIOL_RESPONSE_24HR_UP" at place 12
+
+
+# Combine pheno data
+
+Next we combine the sample data from the two data sets via "rbind", we re-arrange some values so that coincide, but neither categorical variables will be included in the analysis, concluded out of the Lasso analysis in the other report. We also annotate all the samples from the Gou data set with a patient ID, because this is an important variable for Laia's data. 
+
+```{r combine pheno data}
+
+temp.laia <- sample.info[,c(3,7,14,24)]
+
+# Change the levels of the PAM50 variable so that its similar to gou
+temp.laia[temp.laia$`PDX intrinsic subtype (PAM50)`=="Luminal B",3] <- "B"
+temp.laia[temp.laia$`PDX intrinsic subtype (PAM50)`=="Her2-enriched",3] <- "Her2"
+temp.laia[temp.laia$`PDX intrinsic subtype (PAM50)`=="Basal-like",3] <- "Basal"
+
+temp.gou <- sample.gou[,c(1,4,3,5)]
+
+colnames(temp.laia) <- c("sample","metastatic","PAM50","response")
+
+colnames(temp.gou) <- c("sample","metastatic","PAM50","response")
+
+sample.all <- rbind(temp.laia, temp.gou)
+
+
+# still need to account for PDXs coming from the same patient, gave the samples from the Gou study random numbers from 1 to 21. 
+
+patients <- c(sample.info$`Patient ID`,1:21)
+sample.all$patient <- patients
+
+rownames(sample.all) <- sample.all$sample
+
+sample.all$batch <- rep(c("Laia","Gou"),c(35,21))
+
+save(sample.all, file = "combined_sample_data.RData")
+
+```
+
+
+# combine data sets
+
+We gonna combine the raw data's, NOT apply COMBAT, apply DESeq2 lib size correction, and perform DESeq2 DEA
+
+## method 1
+
+```{r}
+
+# raw laia data
+head(laia.raw.data)
+
+# raw Gou data
+head(gou.raw.data)
+
+# ranges are similar
+range(laia.raw.data)
+range(gou.raw.data) 
+
+# dimensions
+dim(laia.raw.data)
+dim(gou.raw.data)
+
+# common genes: 15048
+common.genes <- intersect(rownames(laia.raw.data),rownames(gou.raw.data))
+
+# combined raw data
+combined.raw <- cbind(laia.raw.data[common.genes,], 
+                      gou.raw.data[common.genes,])
+
+# now we got raw combined data and can perform DESeq2!
+head(combined.raw)
+
+save(combined.raw, file = "combined_raw.RData")
+```
+
+# Explore:
+
+- do TMM
+- lib sizes
+- clustering
+- PCA
+
+
+## TMM 
+
+```{r}
+library(edgeR)
+
+colnames(combined.raw) <- rownames(sample.all)
+
+# Create a DGEList object
+combined.dge <- DGEList(counts = combined.raw)
+
+# Perform TMM normalization
+combined.dge <- calcNormFactors(combined.dge, method = "TMM")
+
+# extract normalized reads
+combined.raw.norm <- cpm(combined.dge)
+
+
+# Create a data frame for plotting
+plotData <- data.frame(Sample = colnames(combined.dge$counts), LibrarySize = combined.dge$samples$lib.size)
+
+# plot libary sizes
+ggplot(plotData, aes(x = Sample, y = LibrarySize)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Library Sizes", x = "Sample", y = "Library Size") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+```
+
+## distribution normalized combined
+
+Lets log(x+1) the combined and TMM normalized data to see how the distribution behave and if the TMM did eliminate most of the libary size differences. Indeed on the plot is seen how the medians of the distributions all align. 
+
+```{r expression distribution Gou data normalized, warning=F}
+
+
+# Convert the data frame to a tibble for easier manipulation (if needed)
+norm.data_tibble <- as_tibble(log(combined.raw.norm+1))
+rownames(norm.data_tibble) <- rownames(combined.raw.norm)
+# Add row names as a column
+plot_data <- norm.data_tibble %>%
+  rownames_to_column(var = "Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "sample", values_to = "Expression")
+
+plot_data$response <- rep(sample.all$batch, 15048)
+
+# Plot the expression distribution
+ggplot(plot_data, aes(x = sample, y = Expression, fill = response)) +
+  geom_boxplot(color = "black") +
+  labs(x = "Sample", y = "Expression") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## Clustering 
+
+Lets check if based on the combined normalized data, that the samples cluster per study/batch. As seen on the plot, there is no clear division of samples per study, which is a good sign the data can be combined without being to differing. 
+
+```{r}
+# Perform hierarchical clustering on gene expression matrix
+
+hc <- hclust(dist(t(combined.raw.norm)), method = "ward.D2")
+
+# Plot the dendrogram with colored labels
+sample_colors <- ifelse(sample.all$batch == "Laia", "blue","red")
+
+dend <- as.dendrogram(hc)
+sample_colors <- sample_colors[order.dendrogram(dend)]
+labels_colors(dend) <- sample_colors
+labels_cex(dend) <- 0.4
+plot(dend, main = "Dendrogram: ward.d2 of normalized expression data")
+legend("topright", 
+     legend = c("Gou","Laia"), 
+     col = c("red", "blue"), 
+     pch = c(20,20), bty = "n",  pt.cex = 1.5, cex = 0.6 , 
+     text.col = "black", horiz = FALSE, inset = c(0, 0.1))
+
+```
+
+## PCA
+
+```{r PCA combined data, warning=F, error=F, message=F}
+combined.raw.matrix <- as.matrix(combined.raw.norm)
+
+pca.filt <- prcomp(t(combined.raw.matrix),scale. = F)
+summary(pca.filt)$importance[,c(1:3)]
+
+## Scores data
+scores2 <- data.frame(pca.filt$x[, c("PC1", "PC2")])
+scores2$class <- sample.all$response
+
+labels <- data.frame(pca.filt$x[, c("PC1", "PC2")])
+labels$class <- sample.all$sample
+
+
+scoresplot <- ggplot(data = scores2, aes(x = PC1, y = PC2, colour = class)) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste("PC1 (", round(summary(pca.filt)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste("PC2 (", round(summary(pca.filt)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + 
+  theme_bw() + 
+    geom_label(
+    label=labels$class, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T, cex = 1.5,size = 8)
+scoresplot
+
+library(ggplot2)
+ggsave("pca_combined.png", scoresplot, width = 12, height = 4, dpi = 300)
+```
+
+The PC scores based on the normalized combined data show very similar scores across samples, except one clearly outlying Resistant sample. 
+
+# DEA combined
+## response+meta+PAM50
+
+We got the same problem as before, if we want to add the clinical variables to the model we cannot add the patientID cause of full-rank error during the DESeq2 step. So, we have to chose between adding the patientID or adding the variables.
+Next, follows both models: 
+
+```{r response + clin var, eval = F}
+
+# Add design formula to dds object
+design.combined.raw <- model.matrix(~0+sample.all$response+sample.all$metastatic+sample.all$PAM50)
+rownames(design.combined.raw) <- sample.all$sample
+colnames(design.combined.raw) <- gsub("sample.all\\$", "", colnames(design.combined.raw))
+colnames(design.combined.raw) <- gsub("response", "", colnames(design.combined.raw))
+
+colnames(combined.raw) <- rownames(sample.all)
+
+dds.combined.raw <- DESeqDataSetFromMatrix(countData = as.matrix(combined.raw),colData = sample.all,design= design.combined.raw)
+
+dds.combined.raw <- DESeq(dds.combined.raw)
+
+# Global model
+res.comb <- results(dds.combined.raw, alpha=0.05) #lfcThreshold is by default 0
+summary(res.comb)
+
+# Contrasts: resistant vs. sensitive
+res.comb <- results(dds.combined.raw, contrast = c(1,-1,0,0,0,0), alpha = 0.05)
+summary(res.comb)
+
+res.comb.DF <- as.data.frame(res.comb)
+res.comb.DFS <- res.comb.DF[order(res.comb.DF$pvalue),]
+res.comb.DFSign <- res.comb.DFS[!is.na(res.comb.DFS$pvalue) & res.comb.DFS$padj<0.05 & abs(res.comb.DFS$log2FoldChange) > 1, ] # 561 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res.comb.DFSign <- res.comb.DFSign[!is.na(res.comb.DFSign$baseMean),]
+
+
+# List of DEGs between Responder and non-responders out of the combined data set !
+
+library(DT)
+datatable(res.comb.DFSign)
+
+# lets plot histogram of pvalues
+
+hist(res.comb.DFSign$pvalue, 100)
+
+```
+
+### MSigDB
+
+After Hallmark and C2-term enrichment we can again see that the terms we previously had come back: Estrogen response early and late and EMT, which is very nice. 
+
+It does also learns us that the DEGs that came out Laia's data are more abundant in the DEGs out of the combined data set, since no C2's or Hallmarks are coming back 
+
+```{r, eval = F}
+genes.deseq <- rownames(res.comb.DFSign)
+
+ids.deseq <- mapIds(org.Hs.eg.db, genes.deseq, "ENTREZID", "SYMBOL")
+
+em.deseq <- enricher(ids.deseq, TERM2GENE=H.entrez)
+em.deseq
+dotplot(em.deseq)
+
+em.c.deseq <- enricher(ids.deseq, TERM2GENE = C2.entrez)
+em.c.deseq
+
+dotplot(em.c.deseq)
+
+```
+
+## re + pt, resistant
+
+```{r response + patientID, eval = F}
+
+# Add design formula to dds object
+design.combined.raw.pt <- model.matrix(~0+sample.all$response+sample.all$patient)
+rownames(design.combined.raw.pt) <- sample.all$sample
+colnames(design.combined.raw.pt) <- gsub("sample.all\\$", "", colnames(design.combined.raw.pt))
+colnames(design.combined.raw.pt) <- gsub("response", "", colnames(design.combined.raw.pt))
+
+colnames(combined.raw) <- rownames(sample.all)
+
+dds.combined.raw.pt <- DESeqDataSetFromMatrix(countData = as.matrix(combined.raw),colData = sample.all,design= design.combined.raw.pt)
+
+dds.combined.raw.pt <- DESeq(dds.combined.raw.pt)
+
+# Global model
+res.comb.pt <- results(dds.combined.raw.pt, alpha=0.05) #lfcThreshold is by default 0
+summary(res.comb.pt)
+
+# Contrasts: resistant vs. sensitive
+res.comb.pt <- results(dds.combined.raw.pt, contrast = c(1,-1,rep(0,50)), alpha = 0.05)
+summary(res.comb.pt)
+
+res.comb.DF.pt <- as.data.frame(res.comb.pt)
+res.comb.DFS.pt <- res.comb.DF.pt[order(res.comb.DF.pt$pvalue),]
+res.comb.DFSign.pt <- res.comb.DFS.pt[!is.na(res.comb.DFS.pt$pvalue) & res.comb.DFS.pt$padj<0.05 & abs(res.comb.DFS.pt$log2FoldChange) > 1, ] # 561 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res.comb.DFSign.pt <- res.comb.DFSign.pt[!is.na(res.comb.DFSign.pt$baseMean),]
+
+
+# List of DEGs between Responder and non-responders out of the combined data set !
+library(DT)
+datatable(res.comb.DFSign.pt)
+
+# lets plot histogram of pvalues
+
+hist(res.comb.DFSign.pt$pvalue, 100)
+
+
+save(res.comb.DFSign.pt, file = "DEG_combined_data_Pt.RData")
+
+```
+
+## re + pt, sensistive
+
+```{r response + patientID sensitive up, eval = F}
+
+# Add design formula to dds object
+design.combined.raw.pt <- model.matrix(~0+sample.all$response+sample.all$patient)
+rownames(design.combined.raw.pt) <- sample.all$sample
+colnames(design.combined.raw.pt) <- gsub("sample.all\\$", "", colnames(design.combined.raw.pt))
+colnames(design.combined.raw.pt) <- gsub("response", "", colnames(design.combined.raw.pt))
+
+colnames(combined.raw) <- rownames(sample.all)
+
+dds.combined.raw.pt <- DESeqDataSetFromMatrix(countData = as.matrix(combined.raw),colData = sample.all,design= design.combined.raw.pt)
+
+dds.combined.raw.pt <- DESeq(dds.combined.raw.pt)
+
+# Global model
+res.comb.pt <- results(dds.combined.raw.pt, alpha=0.05) #lfcThreshold is by default 0
+summary(res.comb.pt)
+
+# Contrasts: sens vs. resist, sensitive upregulated
+res.comb.pt.sens.up <- results(dds.combined.raw.pt, contrast = c(-1,1,rep(0,50)), alpha = 0.05)
+summary(res.comb.pt.sens.up)
+
+res.comb.DF.pt.sens <- as.data.frame(res.comb.pt.sens.up)
+res.comb.DFS.pt.sens <- res.comb.DF.pt.sens[order(res.comb.DF.pt.sens$pvalue),]
+res.comb.DFSign.pt.sens <- res.comb.DFS.pt.sens[!is.na(res.comb.DFS.pt.sens$pvalue) & res.comb.DFS.pt.sens$padj<0.05 & abs(res.comb.DFS.pt.sens$log2FoldChange) > 1, ] # 561 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res.comb.DFSign.pt.sens <- res.comb.DFSign.pt.sens[!is.na(res.comb.DFSign.pt.sens$baseMean),]
+
+
+# List of DEGs between Responder and non-responders out of the combined data set !
+library(DT)
+datatable(res.comb.DFSign.pt.sens)
+
+# lets plot histogram of pvalues
+
+hist(res.comb.DFSign.pt.sens$pvalue, 100)
+
+
+save(res.comb.DFSign.pt.sens, file = "DEG_combined_data_Pt_sens_up.RData")
+
+```
+
+```{r}
+load("DEG_combined_data_Pt_sens_up.RData")
+df <- res.comb.DFSign.pt.sens[,c(1,2,6)]
+
+df$Genes <- rownames(res.comb.DFSign.pt.sens)
+
+df <- df[,c(4,1,2,3)]
+
+library(writexl)
+
+write_xlsx(df, path = "1072DEGs.xlsx")
+```
+
+
+
+### Heatmap
+
+
+```{r heatmap based on gene expression}
+exp <- combined.raw.norm[rownames(res.comb.DFSign.pt.sens),]
+
+range(exp)
+
+class(exp)
+dim(exp)
+
+all.equal(colnames(exp), sample.all$sample)
+
+# Create sample groups (e.g., responders and non-responders)
+sample.variables <- sample.all[,c(4,6)]
+sample.variables$response <- factor(sample.variables$response)
+sample.variables$batch <- factor(sample.variables$batch)
+
+sample.variables$batch <- ifelse(sample.variables$batch=="Laia", "Internal", "Gou et al.")
+
+sample.variables$batch <- factor(sample.variables$batch)
+
+# Define colors for the sample groups
+response_colors <- c("#1f78b4", "#33a02c")
+batch_colors <- c("#e31a1c", "#ff7f00")
+
+# Calculate sample distance matrix
+dist_matrix <- dist(t(exp), method = "euclidean")
+
+# Perform hierarchical clustering on the samples using Ward's method
+cluster_cols <- hclust(dist_matrix, method = "ward.D2")
+
+# Create the pheatmap
+heatmap <- pheatmap((exp),
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = dist_matrix,
+         clustering_method = "ward.D2",scale = "row",
+         col = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize = 7,
+         annotation_col = sample.variables,
+         show_rownames = FALSE,annotation_colors =list(
+  response = c(Resistant = "#66c2a5", Sensitive = "#fc8d62"),
+  batch = c("Gou et al."= "#8da0cb", "Internal" = "#e78ac3")),
+         angle_col = 45)
+ggsave("heatmap_DEG.png", heatmap, dpi = 300, width = 8, height = 6, units = "in")
+
+```
+
+This results in exactly the same genes, but differnt sign
+
+### MSig DB pt
+
+```{r}
+genes.deseq.pt <- rownames(res.comb.DFSign.pt.sens)
+
+ids.deseq.pt <- mapIds(org.Hs.eg.db, genes.deseq.pt, "ENTREZID", "SYMBOL")
+
+em.deseq.pt <- enricher(genes.deseq.pt, TERM2GENE=H.symbol)
+em.deseq.pt
+barplot(em.deseq.pt)
+
+
+ggsave(dotplot(em.deseq.pt), filename = "Hallmarks_dotplot.png")
+
+
+save(em.deseq.pt, file = "hallmarks_pt_sens.RData")
+
+em.c.deseq.pt <- enricher(ids.deseq.pt, TERM2GENE = C2.entrez)
+em.c.deseq.pt
+
+dotplot(em.c.deseq.pt)
+
+```
+
+Same but for only sensitive filtered DEG
+
+```{r}
+# subset only upregulated genes in sensitive (so negative logFC)
+sensitive.deg <- res.comb.DFSign.pt %>% filter(log2FoldChange<0) %>% rownames()
+
+ids.deseq.pt <- mapIds(org.Hs.eg.db, genes.deseq.pt, "ENTREZID", "SYMBOL")
+
+em.deseq.sens.pt <- enricher(sensitive.deg, TERM2GENE=H.symbol)
+em.deseq.sens.pt
+
+dotplot(em.deseq.sens.pt)
+
+em.c.deseq.sens.pt <- enricher(sensitive.deg, TERM2GENE = C2.symbol)
+dotplot(em.c.deseq.sens.pt)
+```
+
+We proved the directionality of the Hallmark term to be: enriched in the Sensitive or Responding Patients!!
+Which is good because we expect Estrogen response in these samples. 
+To be sure lets do the same for the resistant samples
+
+```{r}
+# subset only upregulated genes in resistant (so positive logFC)
+pos.deg <- res.comb.DFSign.pt %>% filter(log2FoldChange>0) %>% rownames()
+
+em.deseq.pos.pt <- enricher(pos.deg, TERM2GENE=H.symbol)
+em.deseq.pos.pt
+
+dotplot(em.deseq.pos.pt)
+
+em.c.deseq.pos.pt <- enricher(pos.deg, TERM2GENE = C2.symbol)
+dotplot(em.c.deseq.pos.pt)
+```
+Interferon-Stimulated Genes Are Involved in Cross-resistance to Radiotherapy in Tamoxifen-Resistant Breast Cancer ! 
+
+This explains why we see so many interferon terms in the resistant group. 
+
+### REDO but remove outlier
+
+```{r}
+
+# Add design formula to dds object
+
+sample.all.rm.out <- sample.all[!sample.all$patient %in% "Pt346",]
+
+
+
+design.combined.raw.pt.rm.out <- model.matrix(~0+sample.all.rm.out$response+sample.all.rm.out$patient)
+rownames(design.combined.raw.pt.rm.out) <- sample.all.rm.out$sample
+colnames(design.combined.raw.pt.rm.out) <- gsub("sample.all\\$", "", colnames(design.combined.raw.pt.rm.out))
+colnames(design.combined.raw.pt.rm.out) <- gsub("response", "", colnames(design.combined.raw.pt.rm.out))
+
+combined.raw.rm.out <- combined.raw[,-9]
+
+colnames(combined.raw.rm.out) <- rownames(sample.all.rm.out)
+
+dds.combined.raw.pt.rm.out <- DESeqDataSetFromMatrix(countData = as.matrix(combined.raw.rm.out),colData = sample.all.rm.out,design= design.combined.raw.pt.rm.out)
+
+dds.combined.raw.pt.rm.out <- DESeq(dds.combined.raw.pt.rm.out)
+
+# Global model
+res.comb.pt.rm.out.global <- results(dds.combined.raw.pt.rm.out, alpha=0.05) #lfcThreshold is by default 0
+summary(res.comb.pt.rm.out.global)
+
+# Contrasts: sens vs. resist, sensitive upregulated
+res.comb.pt.rm.out <- results(dds.combined.raw.pt.rm.out, contrast = c(-1,1,rep(0,49)), alpha = 0.05)
+summary(res.comb.pt.rm.out)
+
+res.comb.pt.sens.up.rm.out <- as.data.frame(res.comb.pt.rm.out)
+res.comb.pt.sens.up.rm.out <- res.comb.pt.sens.up.rm.out[order(res.comb.pt.sens.up.rm.out$pvalue),]
+res.comb.pt.sens.up.rm.out <- res.comb.pt.sens.up.rm.out[!is.na(res.comb.pt.sens.up.rm.out$pvalue) & res.comb.pt.sens.up.rm.out$padj<0.05 & abs(res.comb.pt.sens.up.rm.out$log2FoldChange) > 1, ] # 561 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res.comb.DFSign.pt.sens.rm.out <- res.comb.pt.sens.up.rm.out[!is.na(res.comb.pt.sens.up.rm.out$baseMean),]
+
+
+# List of DEGs between Responder and non-responders out of the combined data set !
+library(DT)
+datatable(res.comb.DFSign.pt.sens.rm.out)
+
+# lets plot histogram of pvalues
+
+hist(res.comb.DFSign.pt.sens.rm.out$pvalue, 100)
+
+
+save(res.comb.DFSign.pt.sens.rm.out, file = "DEG_combined_data_Pt_sens_up_rm_out.RData")
+```
+
+Check if the top genes are in common
+
+```{r}
+intersect(rownames(res.comb.DFSign.pt.sens),rownames(res.comb.DFSign.pt.sens.rm.out))
+```
+
+All 1066 genes are in common, just when we dont remove the sample, around 10 more DEG are found. so, no worries, we don't have to redo everything. Let's chekc the Hallmarks. 
+
+```{r}
+# subset only upregulated genes in resistant (so positive logFC)
+pos.deg.rm.out <- res.comb.DFSign.pt.sens.rm.out %>% filter(log2FoldChange>0) %>% rownames()
+
+em.deseq.pos.pt.rm.out <- enricher(pos.deg.rm.out, TERM2GENE=H.symbol)
+em.deseq.pos.pt.rm.out
+
+dotplot(em.deseq.pos.pt.rm.out)
+
+em.c.deseq.pos.pt.rm.out <- enricher(pos.deg.rm.out, TERM2GENE = C2.symbol)
+dotplot(em.c.deseq.pos.pt.rm.out)
+```
+
+# intersecting results
+
+We can see that the results are more shifted towards those from the Gou analysis.
+
+```{r}
+# intersect of "response+PAM50+meta" results with results of Gou analysis, have 291 DEG in common
+intersect(genes.deseq, genes.gou)
+
+# intersect of "response+patientID" results with results of Gou analysis, have 102 DEG in common
+intersect(genes.deseq.pt, genes.gou)
+```
