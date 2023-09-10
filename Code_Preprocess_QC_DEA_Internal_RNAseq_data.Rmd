@@ -1,0 +1,1760 @@
+---
+title: "QC & DEA of the Internal bulk RNAseq data set"
+author: "Gilles Flamen"
+date: "`r format(Sys.time(), '%d %b %Y')`"
+output: 
+  BiocStyle::html_document: 
+    theme: spacelab 
+    number_sections: yes 
+    toc_float: yes 
+    toc_depth: 3
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+
+h1.title { 
+  text-align: center; 
+  margin-top: 60px; 
+  margin-bottom: 30px;
+}
+
+img + em { 
+  display: inherit; 
+  text-align: center; 
+  font-size: 8pt; 
+  color: #1a81c2; 
+  font-style: inherit; 
+  font-weight: bold; 
+}
+
+</style>
+```
+
+------------------------------------------------------------------------
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+[Introduction]{.underline}:
+
+This report presents the results of the initial phase of the project
+aimed at developing a gene expression signature for classifying breast
+cancer patients as Resistant or Sensitive to endocrine therapy (ET). The
+analysis involves RNAseq data from 35 patients, with the goal of
+identifying genes that are differentially expressed between the 6
+Sensitive samples and the 29 Resistant samples. These differentially
+expressed genes will be used to construct a classification model, which
+will be further validated using data from other studies that have
+investigated or measured the same phenotype (resistant vs. sensitive to
+ET). The ultimate objective is to develop a robust gene expression
+signature that can accurately classify patients' response to endocrine
+therapy.
+
+[Content]{.underline}:
+
+First, the samples were loaded and processed into a suitable format.
+Then, the relationships between variables and the target phenotype,
+Response, were examined. Statistical tests were applied to determine if
+gene expression differed across groups defined by certain clinical
+variables. This analysis aimed to identify important variables to be
+included in the subsequent differential gene expression analysis (DEA),
+as variables with a significant impact on gene expression could
+introduce bias if not accounted for in the DEA design formula.
+
+Hierarchical clustering of the samples and principal component analysis
+(PCA) were performed to explore the underlying structure and variability
+in the data.
+
+DEA was carried out using two different methods: DESeq2 and Limma-voom.
+The results for each method and model were named as follows:
+
+DESeq2:
+
+-   Model: \~ Patient + Response (labeled as "label" in R) =\> Result:
+    "res3DFSign"
+
+-   Model: \~ PI3K + PAM50 + biopsy.state + Patient + Response =\>
+    Result: Not successful, had to remove Patient
+
+-   Model: \~ PI3K + PAM50 + biopsy.state + Response =\> Result:
+    "res.clin.DFSign"
+
+-   Model: \~ Age + SV1 + SV2 + Response =\> Result: "res.SV.DF.sign"
+
+Limma-voom:
+
+-   Model: \~ Patient + Response =\> Result: "limma.pt.deg"
+
+-   Model: \~ PI3K + PAM50 + biopsy.state + Patient + Response =\>
+    Result: "top.table"
+
+All results were filtered for a significance level of 0.05 and an
+absolute log fold change greater than 1. Venn diagrams were created to
+visualize the overlap of differentially expressed genes (DEGs) between
+the methods, and volcano plots were used to highlight the top DEGs.
+
+Finally, functional analysis was performed by investigating enriched
+Hallmark and C2 terms in the mSigDB for all the results obtained from
+the different methods and models. This analysis provided insights into
+the biological pathways and processes associated with the identified
+DEGs.
+
+[Conclusions]{.underline}:
+
+1.  The boxplot analysis revealed significant differences in gene
+    expression among various factors including PAM50 classes, Age,
+    Hormone response, metastasis status before biopsy, PatientID and
+    PI3K alterations. However, no significant differences were observed
+    when grouping for "priorET" or "ESR1 alterations".
+
+    These significant variables could be added to the model when
+    determining differentially expressed genes (DEGs). However, it
+    should be noted that Age and Patient variables exhibit high
+    collinearity, which poses challenges during analysis. As an
+    alternative, incorporating only "PatientID" along with other
+    significant variables might provide valuable insights in identifying
+    DEGs.
+
+2.  The clustering analysis based on the Poisson Distance of gene counts
+    reveals that the Resistant and Sensitive samples do not cluster
+    together. There are no clear outlying samples observed in the PC
+    plot.
+
+3.  The top results (top DEGs) from the DESeq2 and Limma with the
+    patient+response model were similar, depicted in the Volcano plot.
+    Although no significant results were found when adjusting for
+    multiple testing after limma-voom analysis, filtering for p.value
+    gave the same top DEGs as the DESeq2 analysis. As well the
+    functional analysis of both results led to the same enriched
+    Hallmarks and C2 terms, that made sense in the context of endocrine
+    therapy resistance. Examples: Estrogen response and
+    epithelial-mesenchymal transition (EMT).
+
+4.  The results when considering as well the clinical variables couldn't
+    be compared between DESeq2 and Limma, due to DESeq2 not allowing
+    PatientID and other clinical variables in the same model.
+    Nonetheless, this suggest that it is not needed to add both, as
+    patientID captures enough of the inter-patient variability. The
+    functional analysis resulted in zero enriched Hallmarks but some
+    enriched C2-terms linked to breast cancer relapse and other cancer
+    types like prostate. Thus not as associated with ET resistance than
+    the previous results (explained in point 3).
+
+5.  The other models were analysed as well but remain questionable. For
+    me, the most important variable to add to the model remain the
+    PatientID and replacing this by Age, Clinical variables, and/or
+    surrogate variable (SV) is not sufficient.
+
+# Libraries
+
+```{r load libraries, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+# images
+library(magick)
+
+# General
+library(dendextend)
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+# Stats
+library(DESeq2)
+library(sva)
+library(limma)
+library(edgeR)
+
+# plotting
+library("pheatmap")
+library("RColorBrewer")
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+
+# Clustering
+library(PoiClaClu)
+```
+
+# Load data
+
+```{r load data, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+# set seed, clustering differs each run
+set.seed(123)
+
+setwd("C:/Users/flame/OneDrive/BARCELONA/VHIO")
+rm(list = ls ())
+# load data
+load("deseq2.dds.RData")
+
+# sample data
+sample.info <- as.data.frame(read_xlsx("230508 Analysis_RNAseq_hormoneresponse_V3.xlsx"))
+
+sample.info222 <- as.data.frame(read_xlsx("230508 Analysis_RNAseq_hormoneresponse_V4.xlsx"))
+
+```
+
+# Preprocess Data
+
+## Sample data
+
+Convert date of birth into age and correct metastatic typo.
+
+```{r}
+
+# Replace "metastasic" with "metastatic" in the "metastasis" column
+sample.info$`Patient status at PDXs biopsy date` <- gsub("Metastasic", "Metastatic", sample.info$`Patient status at PDXs biopsy date`)
+
+cc <- c("21-08-1962", "27-08-1960", "27-12-1927", "19-12-1967", "28-11-1931",
+        "30-07-1979", "23-11-1961", "15-05-1954", "05-07-1971", "17-07-1984",
+        "04-09-1968", "18-04-1945", "23-02-1976", "26-03-1956", "01-06-1965",
+        "17-07-1984", "15-07-1963", "17-07-1962", "17-05-1958", "18-07-1976",
+        "28-07-1943", "30-09-1969", "30-09-1969", "30-09-1969", "19-02-1948",
+        "15-04-1955", NA, "25-08-1955", "30-12-1975", "03-11-1975", "13-06-1943",
+        "19-02-1948", "12-06-1980", "12-06-1980", "26-05-1981")
+
+
+# Convert the dates to the "Date" class
+dates <- as.Date(cc, format = "%d-%m-%Y")
+
+# Calculate ages based on today's date
+ages <- round(as.numeric(difftime(Sys.Date(), dates, units = "days")) / 365.25)
+
+# Replace missing values with NA
+ages[is.na(ages)] <- NA
+
+# Print the ages in the clinical.info data frame
+sample.info$`Date of birth` <- ages
+  
+# check if fixed
+table(sample.info$`Date of birth`)
+
+table(sample.info$`Patient status at PDXs biopsy date`)
+
+```
+
+## Relation: variables \~ phenotype
+
+```{r}
+# Take variables of interest
+clinical_data <- sample.info
+clinical_data2 <- clinical_data[,c(4,7,9,14,15,17,24)]
+
+clinical_data[,c(3,24)]
+
+# Factorise everything
+clinical_data2 <- as.data.frame(lapply(clinical_data2, factor))
+
+# Only then add age
+clinical_data2 <- cbind(clinical_data2, sample.info$`Date of birth`)
+
+# Change names
+rownames(clinical_data2) <- sample.info$`Sample Name`
+
+colnames(clinical_data2) <- c("Patient.ID"                                      ,"Patient.status.at.PDXs.biopsy.date"               
+,"Prior.endocrine.therapy..ET."                     
+,"PDX.intrinsic.subtype..PAM50."                    
+,"PDX.ESR1.alterations"                             
+,"PDX.PI3K.pathway.alterations..PIK3CA..AKT1..PTEN."
+,"Hormone.response..mRECIST.criteria."              
+,"Age")
+
+
+# no
+fisher.test(table(clinical_data2$Patient.status.at.PDXs.biopsy.date, clinical_data2$Hormone.response..mRECIST.criteria.))
+
+# no
+fisher.test(table(clinical_data2$Prior.endocrine.therapy..ET., clinical_data2$Hormone.response..mRECIST.criteria.))
+
+# no
+fisher.test(table(clinical_data2$PDX.intrinsic.subtype..PAM50., clinical_data2$Hormone.response..mRECIST.criteria.))
+
+# no
+fisher.test(table(clinical_data2$PDX.ESR1.alterations, clinical_data2$Hormone.response..mRECIST.criteria.))
+
+# no, but close, C.I. still contains one, thus not good. 
+fisher.test(table(clinical_data2$PDX.PI3K.pathway.alterations..PIK3CA..AKT1..PTEN., clinical_data2$Hormone.response..mRECIST.criteria.))
+
+```
+
+Based on the results, none of the clinical variables showed significant
+enrichment in either the responders or non-responders phenotypic groups.
+This suggests that the clinical variables may not have a substantial
+impact on the differential expression (DE) analysis.
+
+## Preprocess dds
+
+```{r preprocess dds, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+# take the intersect, only 8 samples correspond
+intersect(sample.info$`Sample Name`, dds$sample)
+
+# in one dataset a point, the other a '-' -> fix this 
+sample.info$`Sample Name` <- gsub("\\-",".",sample.info$`Sample Name`)
+
+# take again intersect 
+int.samples <- intersect(sample.info$`Sample Name`, dds$sample) # 35 samples correspond
+
+# 5 samples are not inside the sample information excel sheet
+no.info.samples <- dds$sample[!dds$sample %in% sample.info$`Sample Name`]
+
+# samples that intersect
+int.samples
+
+# samples that not intersect
+no.info.samples
+
+# Select the sample with annotation in sample.info in the dds
+pos <- which(colData(dds)$sample %in% int.samples)
+
+# Subset the dds object with the samples that are annotated in samples.info 
+dds <- dds[,pos]
+
+# Add the label to the dds object 
+
+# Check if order is the same 
+sample.info$`Sample Name`==colData(dds)$sample
+
+# Order the dds object' samples
+colData(dds) <- colData(dds)[order(colData(dds)$sample),]
+
+# Order sample.info' samples
+sample.info <- sample.info[order(sample.info$`Sample Name`),]
+
+# Double check if order is the same now
+sample.info$`Sample Name`==colData(dds)$sample # Yes
+
+# Add Response categorical variable to the dds data
+dds$label <- factor(sample.info$`Hormone response (mRECIST criteria)`)
+
+# check how much from each class 
+table(dds$label)
+```
+
+## Notice
+
+I noticed: Pt474 contains 2 sensitive sample, and 1 Resistant! Should we
+add an interaction term to account for this?
+
+Pt476 one resistant and one sensitive!
+
+Pt525 both resistant!
+
+Importance of including "patientID" as clinical variable!
+
+```{r}
+sample.info[sample.info$`Patient ID`=="Pt474",c(3,4,24)]
+sample.info[sample.info$`Patient ID`=="Pt476",c(3,4,24)]
+sample.info[sample.info$`Patient ID`=="Pt350",c(3,4,24)]
+sample.info[sample.info$`Patient ID`=="Pt525",c(3,4,24)]
+
+```
+
+## Extract data
+
+```{r extract data, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+dds
+
+# extract the Raw count data
+raw.counts <- counts(dds)
+
+# Extract rlog data from dds
+rlog_data <- assays(dds)["rlog"]
+
+# Transform the rlog in an expression matrix
+rlog.expression <- as.matrix(data.frame(rlog_data)[,-c(1,2)])
+```
+
+-   DESeqDataSet: \~30.000 genes and 35 samples.
+-   Two assays: raw Counts & rlog-normalized exp. data
+-   colData: sample = group2 + group3 + group4
+    -   sizeFactors
+
+The "counts" assay contains the raw count data for each gene and each
+sample, while the "rlog" assay contains the normalized data in the form
+of regularized log-transformed values.
+
+The rlog transformation method aims to account for the variability in
+sequencing depth and composition across samples by computing a
+transformation that adjusts for differences in library size and gene
+expression variance. This is achieved by performing a
+variance-stabilizing transformation on the raw counts, followed by a
+regularized log-transformation that shrinks the differences in
+expression values between genes with low counts towards zero. This helps
+to reduce the impact of noise and outliers in the data and provides a
+more accurate representation of gene expression values.
+
+colData names(5): sample Group2 Group3 Group4 sizeFactor: This indicates
+that the DESeqDataSet contains metadata associated with each sample,
+including the sample name, the experimental group to which the sample
+belongs (Group2, Group3, or Group4), and the size factor used in
+normalization.
+
+Size factor allows accurate comparison between samples as it counts for
+differences in sequencing depth between samples and groups. It is used
+in normalization.
+
+## Boxplots before & after norm
+
+Lets check the effect of the normalization:
+
+```{r boxplot unfiltered raw counts}
+
+# Assuming you have a data matrix called "raw.counts"
+
+# Convert the data matrix to a data frame
+df <- as.data.frame(log2(raw.counts+1))
+
+# Create a new data frame for plotting with pivoted labels
+plot_data <- gather(df, key = "variable", value = "value")
+
+# Create the boxplot with pivoted labels
+ggplot(plot_data, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "Sample", y = "Expression") +
+  ggtitle("Boxplot of raw Count Data") 
+
+```
+
+To improve visualization, the gene expression values were transformed to
+log2 scale, as the original scale exhibited a large difference between
+outliers and the rest of the data. However, even with this
+transformation, noticeable differences in expression distribution are
+still present among the samples, indicating the need to address these
+differences. To further examine the variation, the rlog-normalized data
+will be assessed.
+
+```{r boxplot rlog expression}
+
+# Convert the data matrix to a data frame
+df2 <- as.data.frame(rlog.expression)
+
+
+
+# Create a new data frame for plotting with pivoted labels
+plot_data2 <- gather(df2, key = "variable", value = "value")
+
+# Create the boxplot with pivoted labels
+ggplot(plot_data2, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "Sample", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") 
+
+```
+
+All samples follow now more or less the same expression distribution, as
+wanted.
+
+## Relation Clinical var \~ Gene expression
+
+```{r}
+
+plot_data$Age <- rep(sample.info$`Date of birth`,each = 29744)
+plot_data$Age <- factor(plot_data$Age)
+
+ggplot(plot_data, aes(x = Age,y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "Age", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") + 
+  stat_compare_means(paired = FALSE, label.y = 23, size = 3, label.x = 5)
+
+
+
+# Assuming plot_data is the dataframe containing the expression values, response, and PAM50 information
+
+# Add the repeated PAM50 and response columns to the plot_data dataframe
+plot_data$PAM50 <- rep(sample.info$`PDX intrinsic subtype (PAM50)`, each = 29744)
+plot_data$response <- rep(sample.info$`Hormone response (mRECIST criteria)`, each = 29744)
+plot_data$ESR1 <- rep(sample.info$`PDX ESR1 alterations`, each = 29744)
+plot_data$priorET <- rep(sample.info$`Prior endocrine therapy (ET)`, each = 29744)
+plot_data$biopsy <- rep(sample.info$`Biopsy localisation`, each = 29744)
+plot_data$metastasis <- rep(sample.info$`Patient status at PDXs biopsy date`, each = 29744)
+plot_data$patientID <- rep(sample.info$`Patient ID`, each = 29744)
+plot_data$PI3K <- rep(sample.info$`PDX PI3K-pathway alterations (PIK3CA, AKT1, PTEN)`, each = 29744)
+
+# Create the boxplot with each response group
+ggplot(plot_data, aes(x = response, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "Response", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+# Create the boxplot with each PAM50 class
+ggplot(plot_data, aes(x = PAM50, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "PAM50 class", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+
+# Create the boxplot with each PAM50 class
+ggplot(plot_data, aes(x = ESR1, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "ESR1 alterations", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+# Create the boxplot with each priorET class
+ggplot(plot_data, aes(x = priorET, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "prior ET", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+
+# Create the boxplot with each response group
+ggplot(plot_data, aes(x = biopsy, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "biopsy location", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+# Create the boxplot with each response group
+ggplot(plot_data, aes(x = metastasis, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "metastasis before biopt", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+
+# Create the boxplot with each response group
+ggplot(plot_data, aes(x = patientID, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "Patient ID", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+# Create the boxplot with each PI2K group
+ggplot(plot_data, aes(x = PI3K, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(x = "PI3K", y = "Expression") +
+  ggtitle("Boxplot of Normalized Data") +  stat_compare_means(paired=FALSE,label.y = 20,size=3)
+
+```
+
+We learn from the boxplots that the gene expression differs
+significantly between PAM50 classes, Age, Hormone response, metastasis
+status before biopsy, and Patient ID, PI3K alterations.
+
+-   PI3K
+-   PAM50
+-   biopsy status
+
+Also: - Age - Patient ID - Hormone repsonse
+
+It does not differs significantly when grouping for "priorET" or "ESR1
+alterations".
+
+The variables that are significantly differing could be interesting to
+add as variables to the model when determining DEG. The problem is that
+Age and Patient are too co-linear. So maybe try adding "PatientID" and
+the other variables that are significantly.
+
+# Clustering of samples
+## DESeq2 method
+
+Quick check how the samples behave towards each other, by clustering and
+PCA.
+
+Another option for calculating sample distances is to use the Poisson
+Distance (Witten 2011), implemented in the PoiClaClu package. This
+measure of dissimilarity between counts also takes the inherent variance
+structure of counts into consideration when calculating the distances
+between samples. The PoissonDistance function takes the original count
+matrix (not normalized) with samples as rows instead of columns, so we
+need to transpose the counts in dds.
+
+```{r clustering Poisson Distance, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+poisd <- PoissonDistance(t(counts(dds)))
+
+# We plot the heatmap in a Figure below.
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+
+samplePoisDistMatrix <- as.matrix( poisd$dd )
+rownames(samplePoisDistMatrix) <- paste( dds$label, dds$sample, sep=" - " )
+colnames(samplePoisDistMatrix) <- NULL
+pheatmap(samplePoisDistMatrix,
+         clustering_distance_rows = poisd$dd,
+         clustering_distance_cols = poisd$dd,
+         col = colors, fontsize_row = 5)
+
+
+```
+
+We can see that the Resistant and Sensitive samples are not clustering
+together based on the Poisson Distance between the gene's counts.
+
+## PCA
+
+```{r Sample aggregation PCA, include = T, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+# compute PCA
+pca.filt <- prcomp(t(rlog.expression),scale. = F)
+summary(pca.filt)$importance[,c(1:3)]
+
+## Scores data
+scores2 <- data.frame(pca.filt$x[, c("PC1", "PC2")])
+scores2$class <- colData(dds)$label
+
+scoresplot <- ggplot(data = scores2, aes(x = PC1, y = PC2, colour = class)) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste("PC1 (", round(summary(pca.filt)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste("PC2 (", round(summary(pca.filt)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + 
+  theme_bw()
+scoresplot
+
+```
+
+The prcomp only works if I dont scale, because they are columns with
+almost zero variance in the expression data. But the data is already
+rlog-ed, so it should be fine. keep in mind that scaling the data can be
+important for PCA as it allows you to compare the relative contributions
+of each variable (i.e., gene) to the overall variability in the data. If
+the genes are not scaled, the ones with larger variances will dominate
+the analysis.
+
+In general we can see no clear outlying samples, must be noted that the
+overall variability that is explained by PC1 and 2 is only 18%...
+
+# Filtering & normalization
+
+DESeq provides four normalization methods for RNA-seq data:
+
+DESeq: median-of-ratios method rlog: regularized logarithm method VST:
+variance stabilizing transformation TMM: trimmed mean of M-values method
+
+But, the bioconducters vignette states:
+
+> "Note that the two transformations offered by DESeq2 are provided for
+> applications other than differential testing. For differential testing
+> we recommend the DESeq function applied to raw counts, as described
+> later in this workflow, which also takes into account the dependence
+> of the variance of counts on the mean value during the dispersion
+> estimation step."
+
+So, actually the normalization method is not of mayor importance since
+we are interested in finding the DEG for our gene expression signature.
+
+```{r filtering, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+# dimensions
+dim(raw.counts) # 29744 genes
+
+# We could filter genes with zeros over all samples or the size of the smallest group 
+keep <- rowSums(raw.counts > 15) >= 6 # keep the genes with more then 10 reads in atleast 5 samples
+countsF <- raw.counts[keep,]
+dim(countsF)  # 18002
+
+load(file = "r_yo_filtered.RData")
+
+# Plot histograms of the normalized expression values
+par(mfrow=c(1,2)) # Set plot layout to 1 row and 2 columns
+hist(rlog.expression, main="RLog Normalization", xlab="Expression Value")
+hist(r.yo.filtered, main="Rlog Norm. and filtered manually", xlab="Expression Value")
+dim(rlog.expression)
+
+# Fancy plot 
+data <- data.frame(expression = c(rlog.expression, r.yo.filtered),
+                   processed = rep(c("RLog", "Rlog+Filtered"), c(length(rlog.expression),length(r.yo.filtered))))
+
+# Plot the histograms using ggplot2
+ggplot(data, aes(x = expression, fill = processed)) +
+  geom_histogram(alpha = 0.4, position = "identity", bins = 50) +
+  xlab("Expression Value") +
+  ylab("Frequency") +
+  ggtitle("Comparison of RLog and RLog+Filter Normalization")
+
+```
+
+In the histogram plot showing the frequency of the different expression
+values of both the initially Rlog expression data present in the dds
+object, and on the other hand the manually filtered reads and
+rlog-normalized using the DESeq2 function `rlog`. The plot shows that
+filtering away the genes with low expression in at least 6 samples,
+results in a more normal distribution of the expression values. Which is
+useful when applying parametric statistics.
+
+# Differential expression analysis
+
+## DESeq2
+
+### Patient model
+
+```{r DESeq filtered and patient, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+# # Filter out the low expressed reads
+# ddsF <- dds[keep,]
+# # 
+# # # Add design formula to dds object 
+# colData(ddsF)$patient <- factor(colData(ddsF)$patient)
+# design(ddsF) <- ~ patient + label
+# 
+# # perform DEseq
+# ddsF <- DESeq(ddsF)
+# save(ddsF, file = "ddsF.RData")
+
+# FASTER TO LOAD -------------------------------------------------
+load("ddsF.RData")
+
+# Global model
+resG3 <- results(ddsF, alpha=0.05) #lfcThreshold is by default 0
+summary(resG3)
+
+# Contrasts: resistant vs. sensitive
+res3 <- results(ddsF, contrast=c("label","Resistant","Sensitive"), alpha = 0.05)
+summary(res3)
+
+res3DF <- as.data.frame(res3)
+res3DFS <- res3DF[order(res3DF$pvalue),]
+res3DFSign <- res3DFS[!is.na(res3DFS$pvalue) & res3DFS$padj<0.05 & abs(res3DFS$log2FoldChange) > 1, ] # 561 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res3DFSign <- res3DFSign[!is.na(res3DFSign$baseMean),]
+
+Genes <- rownames(res3DFSign)
+
+library(openxlsx)
+
+results_excel <- cbind(Genes, res3DFSign)
+
+write.xlsx(results_excel, file = "deseq2_DEG.xlsx")
+
+# res3DFSign
+
+# lets plot histogram of pvalues
+
+hist(resG3$pvalue, 100)
+```
+
+The most appropriate model will be the last one where also the patient
+was added as categorical variable, since some samples came from the same
+patient. This will have impact cause of the patients genetic and
+transcriptomic make up. Additionally, the filtering of low expression
+genes also helped providing a nice histogram distribution. Next step
+will be gene set analysis which will be done on the 561 significantly
+expressed genes inside the 'res3DFSign' data frame.
+
+Later we do the same analysis but with limma since we have a lot of DEGs
+and limma tend to be more stringent. But lets first check which other
+variables are worth it to add to the design formula.
+
+### Which Clinical variables?
+
+Lets create heat maps based on the normalized and filtered genes.
+
+```{r heatmap based on gene expression}
+rlog.exp <- assays(ddsF)[["rlog"]]
+
+class(rlog.exp)
+
+all.equal(colnames(rlog.exp), sample.info$`Sample Name`)
+
+# Create sample groups (e.g., responders and non-responders)
+sample_variables <- data.frame(factor(sample.info$`Hormone response (mRECIST criteria)`))
+rownames(sample_variables) <- colnames(rlog.exp)
+colnames(sample_variables) <- "Response"
+
+sample_variables$prior_ET <- factor(sample.info$`Prior endocrine therapy (ET)`)
+
+# If the patient got any endocrine therapy drug before aggregation of AI, ER degrader & modulators
+
+sample_variables$PAM50 <- factor(sample.info$`PDX intrinsic subtype (PAM50)`)
+
+# PAM50 the gene signature that classifies breast cancer in luminal A, B, her2-enriched, basal-like
+
+sample_variables$ESR1 <- factor(sample.info$`PDX ESR1 alterations`)
+
+# The protein encoding gene for the enstrogen receptor 
+
+sample_variables$PIK3CA <- factor(sample.info$`PDX PI3K-pathway alterations (PIK3CA, AKT1, PTEN)`)
+
+# PI3K-Akt Pathway is an intracellular signal transduction pathway that promotes metabolism, proliferation, cell survival, growth and angiogenesis
+
+
+# Define colors for the sample groups
+response_colors <- c("red", "blue")
+priorET_colors <- c("pink", "lightblue")
+
+# Calculate sample distance matrix
+dist_matrix <- dist(t(rlog.exp), method = "euclidean")
+
+# Perform hierarchical clustering on the samples using Ward's method
+cluster_cols <- hclust(dist_matrix, method = "ward.D2")
+
+# Create the pheatmap
+# heatmap <- pheatmap(rlog.exp,
+#          clustering_distance_rows = "euclidean",
+#          clustering_distance_cols = dist_matrix,
+#          clustering_method = "ward.D2",
+#          col = colorRampPalette(c("blue", "white", "red"))(100),
+#          fontsize = 8,
+#          annotation_col = sample_variables,
+#          show_rownames = FALSE, 
+#          main = "Heatmap clustering of samples based on Rlog-expression",
+#          angle_col = 45)
+
+```
+
+```{r, echo=FALSE}
+knitr::include_graphics("heatmap.png")
+
+```
+
+### Clin var model
+
+We learn from the boxplots (previous section) that the gene expression
+differs significantly between PAM50 classes, Age, Hormone response,
+metastasis status before biopsy, and Patient ID, PI3K alterations.
+
+```{r Clinical Variables (part1), include=T, eval = TRUE}
+
+dds.clin <- dds
+
+dds.clin <- dds[keep,]
+
+dds.clin # filtered expression table
+
+# add the clinical variables
+all.equal(sample.info$`Sample Name`,colData(dds.clin)$sample)
+
+dds.clin$patient <- factor(sample.info$`Patient ID`)
+
+dds.clin$biopsy.state <- factor(sample.info$`Patient status at PDXs biopsy date`)
+
+dds.clin$prior.ET <- factor(sample.info$`Prior endocrine therapy (ET)`)
+
+dds.clin$PAM50 <- factor(sample.info$`PDX intrinsic subtype (PAM50)`)
+
+dds.clin$ESR1 <- factor(sample.info$`PDX ESR1 alterations`)
+
+dds.clin$PI3K <- factor(sample.info$`PDX PI3K-pathway alterations (PIK3CA, AKT1, PTEN)`)
+
+dds.clin$Age <- sample.info$`Date of birth`
+
+# the median age is 59 (one NA sample)
+median(na.omit(dds.clin$Age))
+
+# check if age differs alot between two phenotypes
+boxplot(dds.clin$Age ~ dds.clin$label)
+# not really, although age has big whiskers...
+# nevertheless take median, since we dont want to lose the sensitive sample. 
+
+dds.clin$Age[is.na(dds.clin$Age)] <- median(na.omit(dds.clin$Age))
+
+# double check
+is.na(dds.clin$Age)
+median(dds.clin$Age) # median age still 59, still 35 samples
+```
+
+This is not possible:
+
+```{r adding clinical var (part2), include=T, eval = F}
+# Create design matrix
+
+design(dds.clin) <- ~ PI3K + PAM50 + biopsy.state + patient + label
+
+# Perform DESeq2
+dds.clin <- DESeq(dds.clin)
+```
+
+So, instead we will remove the patientID:
+
+```{r adding clinical var (part3), include=T, eval = T}
+
+# Create design matrix
+# 
+# design(dds.clin) <- ~ PI3K + PAM50 + biopsy.state + label
+# 
+# # Perform DESeq2
+# dds.clin <- DESeq(dds.clin)
+# 
+# save(dds.clin, file = "dds_clin.RData")
+load("dds_clin.RData")
+
+dds.clin
+
+# Global model
+res.clin <- results(dds.clin, alpha=0.05) #lfcThreshold is by default 0
+summary(res.clin)
+
+# Contrasts: resistant vs. sensitive
+res.clin <- results(dds.clin, contrast=c("label","Resistant","Sensitive"), alpha = 0.05)
+summary(res.clin)
+
+res.clin.DF <- as.data.frame(res.clin)
+res.clin.DFS <- res.clin.DF[order(res.clin.DF$pvalue),]
+res.clin.DFSign <- res.clin.DFS[!is.na(res.clin.DFS$pvalue) & res.clin.DFS$padj<0.05 & abs(res.clin.DFS$log2FoldChange) > 1, ] # 217 genes significantly different and abs(L2FC) > 1
+
+
+# Table showing the DEG 
+res.clin.DFSign <- res.clin.DFSign[!is.na(res.clin.DFSign$baseMean),]
+
+# res.clin.DFSign
+
+# lets plot histogram of pvalues
+
+hist(res.clin$pvalue, 100)
+
+```
+
+This code is not evaluated (same as next chunk) since it leads to
+errors. Age & "PatientID" are to similar. And also combinations of Age
+with other variables lead to the same error. For example:
+
+```{r, include=T, eval=F, message=F, error=F}
+dds.pt.pam <- dds.clin
+
+design(dds.pt.pam) <- ~ patient + PAM50 + label
+
+dds.pt.pam <- DESeq(dds.pt.pam)
+
+# tried this -> but I think the PAM50 variation is included in the patient variation, just like age!
+```
+
+> dds.pt.pam \<- DESeq(dds.pt.pam) Error in designAndArgChecker(object,
+> betaPrior) : full model matrix is less than full rank
+
+Multicollinearity can lead to linear dependencies and cause the rank
+deficiency issue. If you find any highly correlated variables, consider
+removing one of them or using dimensionality reduction techniques to
+address multicollinearity.
+
+When attempting to include the "Age" variable, a similar error is
+encountered indicating that the design matrix contains multiple linearly
+dependent columns. To resolve this issue, we can utilize the "patientID"
+variable, which already contains all the necessary information. As we
+observed in the gene expression-based clustering of the samples and
+confirmed in the functional analysis section, we can include only the
+"patientID" variable in the design formula. This approach eliminates the
+problem of linear dependence and allows for successful analysis.
+
+## LIMMA
+
+### Patient
+
+We see in the Mean-variance trend of the voom plot that there are still
+a lot of low counts, even after filtering. So, lets only for the LIMMA
+analysis filter more stringent.
+
+```{r limma filtered, eval = T}
+dds.limma <- dds
+
+keep <- rowSums(raw.counts > 15) >= 6 # keep the genes with more then 10 reads in at least 6 samples
+countsF.limma <- raw.counts[keep,]
+dim(countsF.limma) # 17905    
+
+dds.limma <- dds.limma[keep,]
+
+# design matrix
+design.limma <- model.matrix(~0+ddsF$label+ddsF$patient)
+rownames(design.limma) <- ddsF$sample
+colnames(design.limma) <- gsub("ddsF\\$", "", colnames(design.limma))
+colnames(design.limma) <- gsub("label", "", colnames(design.limma))
+
+dge.f <- DGEList(unlist(assays(dds.limma)[1]))
+#head(dge.f)
+# calculate normalization factors
+dge.f <- calcNormFactors(dge.f)
+
+
+# normalize counts using the TMM method
+dge.f <- cpm(dge.f, normalized.lib.sizes=TRUE)
+
+# It also allows raw data
+voom.res.f <- voom(dge.f, design.limma, plot = T)
+
+# model fit
+fit.f <- lmFit(voom.res.f, design.limma) 
+
+# contrasts
+contrast.matrix <- makeContrasts(con1=Resistant - Sensitive,
+                                 levels = design.limma) 
+# contrasts fit and Bayesian adjustment
+fit2.f <- contrasts.fit(fit.f, contrast.matrix)
+fite.f <- eBayes(fit2.f)
+
+summary(decideTests(fite.f, adjust.method = "fdr"))
+# no results when adjusting for multiple testing 
+
+#global model
+limma.pt.deg <- topTable(fite.f, number = Inf, adjust.method = "none", lfc = 1, p.value = 0.05)
+
+rownames(limma.pt.deg) <- gsub("counts.","",rownames(limma.pt.deg))
+
+limma.pt.full <- topTable(fite.f, number = Inf, adjust.method = "fdr")
+rownames(limma.pt.full) <- gsub("counts.","",rownames(limma.pt.full))
+
+```
+
+Filtering more stringent does eliminate the dark cloud of low read
+counts in the mean-variance trend seen in the voom-plot, but doesn't
+lead to DE genes after FDR correction. Tried as well to apply a log
+transformation before normalization with CPM but this resulted in a
+weird looking voom plot with a lot of variance in the low counts region
+and low variance in the high counts.
+
+Consistent results between the Limma without correction and the DESeq2
+analysis with FDR correction, provides some confidence in the
+reliability of the top ranked-genes.
+
+### Clinical var + Patient
+
+```{r limma age & patient}
+
+dds.clin <- dds
+
+dds.clin <- dds[keep,]
+
+dds.clin # filtered expression table
+
+# add the clinical variables
+all.equal(sample.info$`Sample Name`,colData(dds.clin)$sample)
+# order is the same 
+
+dds.clin$patient <- factor(sample.info$`Patient ID`)
+
+dds.clin$biopsy.state <- factor(sample.info$`Patient status at PDXs biopsy date`)
+
+dds.clin$prior.ET <- factor(sample.info$`Prior endocrine therapy (ET)`)
+
+sample.info$`PDX intrinsic subtype (PAM50)` <- gsub(" ","-", sample.info$`PDX intrinsic subtype (PAM50)`)
+sample.info$`PDX intrinsic subtype (PAM50)` <- gsub("-","_", sample.info$`PDX intrinsic subtype (PAM50)`)
+
+dds.clin$PAM50 <- factor(sample.info$`PDX intrinsic subtype (PAM50)`)
+
+dds.clin$ESR1 <- factor(sample.info$`PDX ESR1 alterations`)
+
+dds.clin$PI3K <- factor(sample.info$`PDX PI3K-pathway alterations (PIK3CA, AKT1, PTEN)`)
+
+dds.clin$Age <- sample.info$`Date of birth`
+
+# the median age is 59 (one NA sample)
+median(na.omit(dds.clin$Age))
+
+# check if age differs a lot between two phenotypes
+boxplot(dds.clin$Age ~ dds.clin$label)
+# not really, although age has big whiskers...
+# nevertheless take median, since we dont want to lose the sensitive sample. 
+
+dds.clin$Age[is.na(dds.clin$Age)] <- median(na.omit(dds.clin$Age))
+
+# double check
+is.na(dds.clin$Age)
+median(dds.clin$Age) # median age still 59, still 35 samples
+
+# Perform limma
+# design matrix
+design.limma <- model.matrix(~0 + dds.clin$label  + dds.clin$patient + dds.clin$biopsy.state + dds.clin$PI3K + dds.clin$PAM50)
+
+rownames(design.limma) <- dds.clin$sample
+colnames(design.limma) <- gsub("dds.clin\\$", "", colnames(design.limma))
+colnames(design.limma) <- gsub("label", "", colnames(design.limma))
+
+
+dge.clin <- DGEList(unlist(assays(dds.clin)[1]))
+# head(dge.clin)
+# calculate normalization factors
+dge.clin <- calcNormFactors(dge.clin, method = "TMM")
+
+#design2 <- model.matrix(~0+dds.clin$Age+dds.clin$patient+dds.clin$label)
+
+# normalize counts using the TMM method
+dge.clin <- cpm(dge.clin, normalized.lib.sizes=TRUE)
+
+# It also allows raw data
+voom.res.clin <- voom(dge.clin, design.limma, plot = T)
+
+# model fit
+fit.clin <- lmFit(voom.res.clin, design.limma)
+
+
+# Coefficient of Age is not estimable
+
+# contrasts
+contrast.matrix <- makeContrasts(con1=Resistant - Sensitive,
+                                 levels = design.limma) 
+# contrasts fit and Bayesian adjustment
+fit2.clin <- contrasts.fit(fit.clin, contrast.matrix)
+fite.clin <- eBayes(fit2.clin)
+
+summary(decideTests(fite.clin, adjust.method = "fdr"))
+
+# significant table of DEG
+top.table <- topTable(fite.clin, number = Inf, adjust.method = "fdr", lfc = 1, p.value = 0.05)
+
+top.initial <- topTable(fite.clin, number = Inf, adjust.method = "none", lfc = 1, p.value = 0.05)
+
+rownames(top.table) <- gsub("counts.","",rownames(top.table))
+
+# significant upregulated- Sensitive
+up <- top.table$logFC<0
+up.table <- top.table[up,]
+
+rownames(up.table) <- gsub("counts.","",rownames(up.table))
+
+
+# full table of genes
+full.table <- topTable(fite.clin, number = Inf, adjust.method = "fdr")
+
+rownames(full.table) <- gsub("counts.","",rownames(full.table))
+
+
+```
+
+
+## SVA
+
+Surrogate values are covariates that try to modulate unknown or
+unmodeled noise or variance in the data.
+
+```{r SVA, include = T, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+# dat  <- counts(ddsF, normalized = TRUE)
+# idx  <- rowMeans(dat) > 1
+# dat  <- dat[idx, ]
+
+# better to use the rlog normalized data
+dat <- unlist(assays(dds.clin)["rlog"])+2
+
+mod  <- model.matrix(~ Age + label, colData(dds.clin))
+
+mod0 <- model.matrix(~   1, colData(dds.clin))
+svseq <- svaseq(dat, mod, mod0, n.sv=2) #let's generate 4 variables
+
+# Typical reason are that a matrix is singular and cannot be inverted or that some vectors are colinear.
+
+par(mfrow = c(2, 2), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq$sv[, i] ~ dds.clin$label, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+}
+
+SV1 <- svseq$sv[,1]
+SV2 <- svseq$sv[,2]
+
+```
+
+I tried to include patient as well in the calculation of the surrogate
+variables, but this gave errors. The SV1 scores are equally distributed
+for the resistant samples, but show rather high (positive) values for
+the sensitive samples. The same counts for the SV2. Thats why I repeated
+it but now with Age instead of PatientID since they are supposed to be
+co-linear.
+
+## DESeq with SVA (instead of patient)
+
+```{r DESeq2 patient sva, include = T}
+
+# Let's now include two of the surrogate variables variables 
+ddssva <- dds.clin
+ddssva$SV1 <- SV1
+ddssva$SV2 <- SV2
+
+design(ddssva) <- ~ SV1 + SV2 + Age + label
+
+ddssva <- DESeq(ddssva)
+# save(ddssva, file = "ddssva.RData")
+
+# Global model
+resG <- results(ddssva)
+
+# Contrasts, we just check two of them
+resSV <- results(ddssva, contrast=c("label","Resistant","Sensitive"))
+summary(resSV)
+
+resSVDF <- as.data.frame(resSV)
+resSVDFS <- resSVDF[order(resSVDF$pvalue),]
+resSVDFSign <- resSVDFS[!is.na(resSVDFS$pvalue) & resSVDFS$padj<0.05 & abs(resSVDFS$log2FoldChange) > 1, ]
+
+# Table with results
+res.SV.DF.Sign <- resSVDFSign[!is.na(resSVDFSign$baseMean),]
+
+ # res.SV.DF.Sign # 203 DEG
+
+hist(resSVDF$pvalue, breaks = 100)
+```
+
+When including the SV inside the design formula when looking for DEGs, a
+total of 66 genes with an absolute logFC higher than 1 and significantly
+differing is found.
+
+Since the SV models unknown sources of variation in your data, the
+differences in gene expression between the Response-groups will be
+mainly from biological origin than technical or other kinds of sources.
+Although, when looking at the functional analysis (below), all genes are
+linked to viral infection and immunological GO terms? Which is
+unexpected in this context, it could be that the SV doesn't capture the
+patient variability so that these DEGs primarily come from this
+variance.
+
+# Representation
+
+## Venn gram
+
+```{r Venn gram, message=F, error=F, warning=F}
+
+# load library
+library(ggvenn)
+
+# makes list with genes
+x <- list(
+  Limma_patient = rownames(top.table),
+  DESeq2_patient = rownames(res3DFSign)
+)
+# make Venn diagram
+v1 <- ggvenn(
+  x, 
+  fill_color = c("#868686FF", "#CD534CFF", "lightblue", "lightgray"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+
+v1 <- v1 + ggtitle("Limma (pt + clin) vs. DESeq (pt)")
+v1
+
+# This Venn diagram compares the 
+# DESeq: ~ PAM50 + biopsy.state + PI3K + label        (no patient)
+# limma: ~ PAM50 + biopsy.state + PI3K + patient + label
+
+x.2 <- list(
+  Limma = rownames(top.table),
+  DESeq2 = rownames(res.clin.DFSign)
+)
+# make Venn diagram
+v2 <- ggvenn(
+  x.2, 
+  fill_color = c("#868686FF", "#CD534CFF", "lightblue", "lightgray"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+
+# only 7 genes in common 
+v2 <- v2 + ggtitle("Limma (pt + clin) vs. DESeq (clin (NO Pt!!))")
+v2
+
+
+# Compare the DESeq's
+
+# makes list with genes
+y <- list(
+  DESeq2_patient = rownames(res3DFSign),
+  DESeq2_Age_SV = rownames(res.SV.DF.Sign),
+  DESeq2_Age = rownames(res.clin.DFSign)
+)
+
+# make Venn diagram
+v3 <- ggvenn(
+  y, 
+  fill_color = c("#868686FF", "#CD534CFF", "lightblue", "lightgray"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+
+
+v3 <- v3 + ggtitle("All Deseq: (Age + clin (NO Pt!)) vs. DESeq (pt) vs. Age + SV1&2 (No Pt!")
+v3
+
+```
+
+We see in the Venn gram (v1) that Deseq2 patient model and the limma
+patient+clin variable model have 120 DEGs in common. It could be
+interesting to test this genes and do functional analyses.
+
+In v2 we can see that the two models give total different results.
+Namely the DESeq2 model with Age + other clinical var compared Limma
+model with Patient + other clinical variable (without Patient). Since I
+find "PatientID" the most important variable, I dont trust the results
+coming from the DESeq2 model without "PatientID".
+
+In the Venn gram (v3) one can observe that when we add the SV to the
+model with only Age, the 136 DEG specifically to the DESeq2_Age model
+are reduced to 25. This depicts the effect of adding the SVs to account
+for unmodulated variation in the gene expression data. What is also
+surprising is that although the Age and Patient variable are almost
+linearly correlated they do not provide the same DEGs!! For me it is
+more logical to add patient than age when you need to chose, since
+patientID will contain the variation inside the Age variable.
+
+## intersect limma & deseq
+
+Took the intersect of the limma "Patient + Clin" and the Deseq2
+"Patient" model. These are the 120 DEGs seen in v1, to see if they give
+good results in the functional analyses.
+
+```{r}
+shared.DEGs <- res3DFSign[intersect(rownames(res3DFSign), rownames(top.table)),]
+
+```
+
+## Volcano's
+
+We will create a nice volcano plot using ggplot2.
+
+```{r volcano, include = T, eval = TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+colorS <- c("blue", "grey", "red")
+#CHECK p or p.adj
+
+#specific parameters
+showGenes <- 20 #genes to be displayed with names
+
+# DESeq2 Patient
+dataV2 <- res3DFS[!is.na(res3DFS$baseMean),]
+dataV2 <- dataV2 %>% mutate(gene = rownames(dataV2), logp = -(log10(pvalue)), logadjp = -(log10(padj)),
+                          FC = ifelse(log2FoldChange>0, 2^log2FoldChange, -(2^abs(log2FoldChange)))) %>%
+                   mutate(sig = ifelse(padj<0.05 & log2FoldChange > 1, "UP", ifelse(padj<0.05 & log2FoldChange < (-1), "DN","n.s"))) #ideally we should have an adj.P.Val < 0.05
+
+                       
+p2 <- ggplot(data=dataV2, aes(x=log2FoldChange, y=logp )) +
+     geom_point(alpha = 1, size= 1, aes(col = sig)) + 
+     scale_color_manual(values = colorS) +
+     xlab(expression("log"[2]*"FC")) + ylab(expression("-log"[10]*"(p.val)")) + labs(col=" ") + 
+     geom_vline(xintercept = 1, linetype= "dotted") + geom_vline(xintercept = -1, linetype= "dotted") + 
+     geom_hline(yintercept = -log10(0.1), linetype= "dotted")  +  theme_bw()+
+  ggtitle(" ~ label + Patient (DESeq2 method)")
+
+p2 <- p2 + geom_text_repel(data = head(dataV2[dataV2$sig != "n.s",],showGenes), aes(label = gene))
+
+
+# Limma Patient
+dataV <- limma.pt.full
+dataV <- dataV %>% mutate(gene = rownames(dataV), logp = -(log10(P.Value)), logadjp = -(log10(adj.P.Val)),
+                          FC = ifelse(logFC>0, 2^logFC, -(2^abs(logFC)))) %>%
+                   mutate(sig = ifelse(P.Value<0.05 & logFC > 1, "UP", ifelse(P.Value<0.05 & logFC < (-1), "DN","n.s"))) #ideally we should have an adj.P.Val < 0.05
+                       
+p <- ggplot(data=dataV, aes(x=logFC, y=logp )) +
+     geom_point(alpha = 1, size= 1, aes(col = sig)) + 
+     scale_color_manual(values = colorS) +
+     xlab(expression("log"[2]*"FC")) + ylab(expression("-log"[10]*"(p.val)")) + labs(col=" ") + 
+     geom_vline(xintercept = 1, linetype= "dotted") + geom_vline(xintercept = -1, linetype= "dotted") + 
+     geom_hline(yintercept = -log10(0.1), linetype= "dotted")  +  theme_bw() +
+  ggtitle(" ~ label + Patient (Limma)")
+
+
+p <- p + geom_text_repel(data = head(dataV[dataV$sig != "n.s",],showGenes), aes(label = gene)) 
+
+
+# Limma Patient + Clin variables
+dataV_limma.clin <- full.table
+rownames(dataV) <- gsub("counts.", "", rownames(dataV))
+dataV_limma.clin <- dataV_limma.clin %>% mutate(gene = rownames(dataV_limma.clin), logp = -(log10(P.Value)), logadjp = -(log10(adj.P.Val)),
+                          FC = ifelse(logFC>0, 2^logFC, -(2^abs(logFC)))) %>%
+                   mutate(sig = ifelse(adj.P.Val<0.05 & logFC > 1, "UP", ifelse(adj.P.Val<0.05 & logFC < (-1), "DN","n.s"))) #ideally we should have an adj.P.Val < 0.05
+
+                       
+pclin <- ggplot(data=dataV_limma.clin, aes(x=logFC, y=logp )) +
+     geom_point(alpha = 1, size= 1, aes(col = sig)) + 
+     scale_color_manual(values = colorS) +
+     xlab(expression("log"[2]*"FC")) + ylab(expression("-log"[10]*"(p.val)")) + labs(col=" ") + 
+     geom_vline(xintercept = 1, linetype= "dotted") + geom_vline(xintercept = -1, linetype= "dotted") + 
+     geom_hline(yintercept = -log10(0.1), linetype= "dotted")  +  theme_bw() +
+  ggtitle(" ~ label + PAM50 + PI3K + biopsy.state + patientID (Limma)")
+
+
+
+pclin <- pclin + geom_text_repel(data = head(dataV_limma.clin[dataV_limma.clin$sig != "n.s",],showGenes), aes(label = gene)) 
+
+
+# DESeq2 Age + SVs 
+dataSV <- resSVDFS[!is.na(resSVDFS$baseMean),] # ordered data
+dataSV <- dataSV %>% mutate(gene = rownames(dataSV), logp = -(log10(pvalue)), logadjp = -(log10(padj)),
+                          FC = ifelse(log2FoldChange>0, 2^log2FoldChange, -(2^abs(log2FoldChange)))) %>%
+                   mutate(sig = ifelse(padj<0.05 & log2FoldChange > 1, "UP", ifelse(padj<0.05 & log2FoldChange < (-1), "DN","n.s"))) 
+
+pSV <- ggplot(data=dataSV, aes(x=log2FoldChange, y=logp )) +
+     geom_point(alpha = 1, size= 1, aes(col = sig)) + 
+     scale_color_manual(values = colorS) +
+     xlab(expression("log"[2]*"FC")) + ylab(expression("-log"[10]*"(p.val)")) + labs(col=" ") + 
+     geom_vline(xintercept = 1, linetype= "dotted") + geom_vline(xintercept = -1, linetype= "dotted") + 
+     geom_hline(yintercept = -log10(0.1), linetype= "dotted")  +  theme_bw()+
+  ggtitle(" ~ label + Age + SV1 + SV2 (DESeq2)")
+
+pSV <- pSV + geom_text_repel(data = head(dataSV[dataSV$sig != "n.s",],showGenes), aes(label = gene), max.overlaps = 20)
+
+
+par(mfrow=c(2,2))
+
+p
+p2
+pclin
+pSV
+```
+
+It is nice to see that the two different analyses, limma-voom and DESeq2
+gave similar results back (Patient model). Although the multiple testing
+was too stringent to show any significant results, when we just worked
+with the non-adjusted pvalue we saw around 871 significant results with
+logFC \> 1, compared to the 561 from the DESeq2 analysis. But, the top
+genes were the same as depicted in the Volcano plot!
+
+Additionally, less results were seen when plotting the results of the
+analysis of the model containing the response variable (label), Age, and
+the first two SVs. The results reduced from 561 to 98! This means that a
+lot of results that were initially observed as DE were originating from
+noise and unmodulated variance instead of biological variance. This is
+also seen in the volcano plot were a lot less colored points are seen.
+Also the top results differ a lot from those found when no SVs were
+added.
+
+When analyzing gene expression data from multiple samples, it is
+important to account for potential confounding factors that could impact
+the results, such as correlations between samples from the same patient.
+This is typically achieved by including patient as a variable in the
+analysis. Surrogate variable analysis can also be useful for correcting
+for other sources of variation in gene expression data, but it may not
+fully capture patient-specific effects. These practices are widely
+accepted in the field of genomics and have been described in many
+publications, including the following references:
+
+> Leek, J. T. et al. Tackling the widespread and critical impact of
+> batch effects in high-throughput data. Nat. Rev. Genet. 11, 733--739
+> (2010).
+
+> Soneson, C. and Delorenzi, M. A comparison of methods for differential
+> expression analysis of RNA-seq data. BMC Bioinformatics 14, 91 (2013).
+> Johnson, W. E. et al. Adjusting batch effects in microarray expression
+> data using empirical Bayes methods. Biostatistics 8, 118--127 (2007).
+
+So I dont trust the result when we replace "PatientID" by "Age" and
+include SVs!
+
+# Functional analysis
+
+```{r load libraries FA, eval = TRUE, echo=F, message=FALSE, error=FALSE, warning=FALSE}
+library(tidyverse)
+
+library(org.Hs.eg.db)
+library(msigdbr)
+
+library(clusterProfiler)
+library(enrichplot)
+```
+
+## MSigDB
+
+In addition, we can directly work on the mSigDB For that purpose we can
+use the CRAN package `r CRANpkg("msigdbr")`. We will extract the
+Hallmark and C2 collections in the entrez ID and the HGNC symbol. Notice
+that we have tibble objects in this case.
+
+```{r msigdb2, eval = T}
+
+# Hallmark
+H <- msigdbr(species = "Homo sapiens", category = "H")
+H
+H.entrez <- H %>% dplyr::select(gs_name, entrez_gene)
+H.symbol <- H %>% dplyr::select(gs_name, gene_symbol)
+dim(table(H$gs_name))
+
+# C2
+C2<- msigdbr(species = "Homo sapiens", category = "C2")
+C2
+C2.entrez <- C2 %>% dplyr::select(gs_name, entrez_gene)
+C2.symbol <- C2 %>% dplyr::select(gs_name, gene_symbol)
+
+
+```
+
+Once gene sets retrieved, let's perform some enrichment.
+
+## DESeq2 
+### Patient
+
+```{r CP5, eval = T}
+# Get the entrez_IDs of the DEG (from the filtered + patient)
+entrez_IDs <- mapIds(org.Hs.eg.db, rownames(res3DFSign), "ENTREZID", "SYMBOL")
+entrez_IDs <- as.character(entrez_IDs[!is.na(entrez_IDs)])
+
+
+# General enrichment, on the gene list 
+gene <- entrez_IDs
+em <- enricher(gene, TERM2GENE=H.entrez)
+em
+barplot(em)
+dotplot(em)
+
+
+em.c <- enricher(gene, TERM2GENE = C2.entrez)
+em.c
+barplot(em.c)
+dotplot(em.c)
+
+```
+
+### Age+SV1+SV1
+
+Lets do the same for the Age model and the Age+SV1&2 model
+
+```{r}
+
+# DEGs
+genes_Age <- rownames(res.clin.DFSign) # 217
+genes_Age_SV <- rownames(resSVDFSign) # 98
+
+# entrez IDs
+eID_Age_SV <- mapIds(org.Hs.eg.db, genes_Age_SV, "ENTREZID", "SYMBOL")
+eID_Age_SV <- as.character(eID_Age_SV[!is.na(eID_Age_SV)])
+
+eID_Age <- mapIds(org.Hs.eg.db, genes_Age, "ENTREZID", "SYMBOL")
+eID_Age <- as.character(eID_Age[!is.na(eID_Age)])
+
+# find enriched terms
+
+# Age 
+em.Age <- enricher(eID_Age, TERM2GENE=H.entrez)
+em.Age
+barplot(em.Age)
+dotplot(em.Age)
+
+em.c.Age <- enricher(eID_Age, TERM2GENE=C2.entrez)
+em.c.Age
+barplot(em.c.Age)
+dotplot(em.c.Age)
+
+
+# Age+SV
+em.Age.SV <- enricher(eID_Age_SV, TERM2GENE = H.entrez)
+em.Age.SV
+barplot(em.Age.SV)
+dotplot(em.Age.SV)
+
+em.c.Age.SV <- enricher(eID_Age_SV, TERM2GENE = C2.entrez)
+em.c.Age.SV
+barplot(em.c.Age.SV)
+dotplot(em.c.Age.SV)
+```
+
+We see that the most enriched terms are linked to covid and influenza
+infections. This could be that the patients were infected by one of the
+viruses which led to differential expression between the two groups of
+patients. As well a lot of interferon genes were upregulated which is
+typical for a viral infection.
+
+Maybe it is still a better approach to add the patient ID instead of Age
+and the SVs. I think patientID captures better the interpatient
+variability and will reduces this biases in the results originating from
+certain viral infections in the patients. It is weird that still after
+adding the SV, patient variability is not accounted for.
+
+Not gonna work further with this model, results make not a lot of sense!
+
+## Limma 
+### Patient
+
+```{r}
+# Get the entrez_IDs of the DEG (from the filtered + patient)
+genes.limma <- rownames(limma.pt.deg)
+genes.limma <- gsub(pattern = "counts.", replacement = "", x = genes.limma)
+
+ids.limma <- mapIds(org.Hs.eg.db, genes.limma, "ENTREZID", "SYMBOL")
+ids.limma <- as.character(ids.limma[!is.na(ids.limma)])
+
+em.limma <- enricher(ids.limma, TERM2GENE=H.entrez)
+em.limma
+barplot(em.limma) 
+dotplot(em.limma)
+
+
+em.c.limma <- enricher(ids.limma, TERM2GENE = C2.entrez)
+em.c.limma
+barplot(em.c.limma)
+dotplot(em.c.limma)
+
+```
+
+The Hallmark results are exactly the same as those reached with the DEG
+from DESeq2 analysis!!
+
+### patient + Clin variables
+
+```{r}
+
+# Get the entrez_IDs of the DEG (from the filtered + patient)
+genes.limma.clin <- rownames(top.table)
+
+
+ids.limma.clin <- mapIds(org.Hs.eg.db, genes.limma.clin, "ENTREZID", "SYMBOL")
+ids.limma.clin <- as.character(ids.limma.clin[!is.na(ids.limma.clin)])
+
+em.limma.clin <- enricher(ids.limma.clin, TERM2GENE=H.entrez)
+em.limma.clin 
+# zero enriched Hallmarks found in the Limma plus clin variables 
+
+em.c.limma.clin <- enricher(ids.limma.clin, TERM2GENE = C2.entrez)
+em.c.limma.clin
+barplot(em.c.limma.clin)
+dotplot(em.c.limma.clin)
+
+
+```
+
+
+### patient+clin (initial, no correction)
+
+```{r}
+# Get the entrez_IDs of the DEG (from the filtered + patient)
+genes.limma.in <- rownames(top.initial)
+
+genes.limma.in <- gsub(pattern = "counts.", replacement = "", x = genes.limma.in)
+
+ids.limma.in <- mapIds(org.Hs.eg.db, genes.limma.in, "ENTREZID", "SYMBOL")
+ids.limma.in <- as.character(ids.limma.in[!is.na(ids.limma.in)])
+
+em.limma.in <- enricher(ids.limma.in, TERM2GENE=H.entrez)
+em.limma.in 
+# zero enriched Hallmarks found in the Limma plus clin variables 
+
+dotplot(em.limma.in)
+
+em.c.limma.in <- enricher(ids.limma.in, TERM2GENE = C2.entrez)
+em.c.limma.in
+barplot(em.c.limma.in)
+dotplot(em.c.limma.in)
+
+```
+
+
+
+These results are not as associated to endocrine therapy resistance than
+the DESeq2-Patient results. But, still some C2 terms are interesting.
+Although, no Hallmark results are found, thus can not be considered for
+filtering the DEGs for the transcriptome signature
+
+### intersect limma(pt+clin)-deseq2(pt)
+
+```{r}
+
+shared.DEGs
+
+# Get the entrez_IDs of the DEG (from the filtered + patient)
+shared.genes <- rownames(shared.DEGs)
+ids.shared <- mapIds(org.Hs.eg.db, shared.genes, "ENTREZID", "SYMBOL")
+ids.shared <- as.character(ids.shared[!is.na(ids.shared)])
+
+em.shared <- enricher(ids.shared, TERM2GENE=H.entrez)
+em.shared
+# zero enriched Hall marks 
+
+
+
+em.c.shared <- enricher(ids.shared, TERM2GENE = C2.entrez)
+em.c.shared
+barplot(em.c.shared)
+dotplot(em.c.shared)
+
+```
+
+
+
+## DEGs in cancer-Hallmarks
+
+```{r}
+# check which genes are linked to the Hallmark!
+
+df.em <- data.frame(em)
+df.em.limma <- data.frame(em.limma)
+
+# estrogen early response 
+genes_estrogen_d <- df.em[1,"geneID"] 
+
+genes_estrogen_d <- unlist(strsplit(genes_estrogen_d, "\\/"))
+
+# Get the symbols from the entrez IDs
+genes_estrogen_d <- mapIds(org.Hs.eg.db, genes_estrogen_d, "SYMBOL", "ENTREZID")
+genes_estrogen_d <- as.character(genes_estrogen_d[!is.na(genes_estrogen_d)])
+
+#-------------------------------------------------------------------
+
+# Check the other hallmark: EMT
+genes_emt_d <- df.em[3,"geneID"] 
+
+genes_emt_d <- unlist(strsplit(genes_emt_d, "\\/"))
+
+# Get the symbols from the entrez IDs
+genes_emt_d <- mapIds(org.Hs.eg.db, genes_emt_d, "SYMBOL", "ENTREZID")
+genes_emt_d <- as.character(genes_emt_d[!is.na(genes_emt_d)])
+
+
+# same for the limma results 
+genes_emt <- df.em.limma[3,"geneID"] 
+
+genes_emt <- unlist(strsplit(genes_emt, "\\/"))
+
+# Get the symbols from the entrez IDs
+genes_emt <- mapIds(org.Hs.eg.db, genes_emt, "SYMBOL", "ENTREZID")
+genes_emt <- as.character(genes_emt[!is.na(genes_emt)])
+
+
+## estrogen late response 
+# Check the other hallmark: EMT
+genes_e_late_d <- df.em[1,"geneID"] 
+
+genes_e_late_d <- unlist(strsplit(genes_e_late_d, "\\/"))
+
+# Get the symbols from the entrez IDs
+genes_e_late_d <- mapIds(org.Hs.eg.db, genes_e_late_d, "SYMBOL", "ENTREZID")
+genes_e_late_d <- as.character(genes_e_late_d[!is.na(genes_e_late_d)])
+
+
+# same for the limma results 
+genes_estrogen <- df.em.limma[2,"geneID"] 
+
+genes_estrogen <- unlist(strsplit(genes_estrogen, "\\/"))
+
+# Get the symbols from the entrez IDs
+genes_estrogen <- mapIds(org.Hs.eg.db, genes_estrogen, "SYMBOL", "ENTREZID")
+genes_estrogen <- as.character(genes_estrogen[!is.na(genes_estrogen)])
+```
+
+
+## Select the candidate genes
+
+The candidate genes can be those in the selection of all DEGs that are
+linked to oncogenic processes, estrogen response, breast cancer, ...
+
+```{r candidates based on Hallmarks}
+
+H[H$gs_name=="HALLMARK_ESTROGEN_RESPONSE_LATE",]
+
+
+# lets take intersect from top DESeq genes, since the top genes are the same as the limma analysis (patient)
+topgenes <- head(rownames(res3DFSign),Inf)
+
+topgenes[topgenes %in% genes_emt_d]
+#topgenes[topgenes %in% genes_emt]
+
+topgenes[topgenes %in% genes_e_late_d]
+
+topgenes[topgenes %in% genes_estrogen_d]
+#topgenes[topgenes %in% genes_estrogen]
+
+intersect(genes_e_late_d,genes_emt)
+
+# could bind them
+Hgenes <- c(genes_e_late_d, genes_emt_d, genes_estrogen_d)
+
+# How much genes to choose? 
+GOI <- topgenes[topgenes %in% Hgenes]
+
+
+up.sensitive <- res3DFSign[res3DFSign$log2FoldChange<0,]
+
+up.sensitive.goi <- na.omit(up.sensitive[GOI,])
+
+# 28 genes of interest that are DE in sensitive BC patients and are enriched in estrogen response and EMT hallmarks. 
+```
+
+
+
