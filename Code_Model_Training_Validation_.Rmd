@@ -1,0 +1,1604 @@
+---
+title: "Results final Models Paper"
+author: "Gilles Flamen"
+date: "`r format(Sys.time(), '%d %b %Y')`"
+output: 
+  BiocStyle::html_document: 
+    theme: spacelab 
+    number_sections: yes 
+    toc_float: yes 
+    toc_depth: 3
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+
+h1.title { 
+  text-align: center; 
+  margin-top: 60px; 
+  margin-bottom: 30px;
+}
+
+img + em { 
+  display: inherit; 
+  text-align: center; 
+  font-size: 8pt; 
+  color: #1a81c2; 
+  font-style: inherit; 
+  font-weight: bold; 
+}
+
+</style>
+```
+
+------------------------------------------------------------------------
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# libraries
+
+```{r, message=F, error=F}
+# Load library and data
+library(caret)
+library(keras)
+library(nnet)
+library(e1071)
+library(randomForest)
+
+library(glmnet)
+library(dplyr)
+library(tidyverse)
+
+library(ggplot2)
+
+library(DESeq2)
+library(edgeR)
+
+library(dendextend)
+
+library(knitr)
+
+```
+
+# load data
+
+The training data is TMM normalized! And as well scaled, since I read this is best to do before model construction.
+
+So when validating the model, lets also TMM the pseudo bulk and the single cell data, and scale it before loading into the model.
+
+
+```{r, message=F, error=F}
+# delete all data
+rm(list = ls())
+
+# load data 
+
+# this is the TMM normalized combined data (genes in the rows!)
+load("combined_raw_norm.RData")
+
+# these are all the DEG after DESeq2 analysis of the combined data
+# positive sign -> upregulated in sensitive samples.
+load("DEG_combined_data_Pt_sens_up.RData")
+
+# load sample.data
+load("combined_sample_data.RData")
+
+# load enricher results for selected-feature model
+load("hallmarks_pt_sens.RData") # object called = em.deseq.pt
+
+```
+
+# Preprocess data 
+
+Let's preprocess the data so that the genes are in the columns and the patients in the rows.
+
+We saw that one patient is a clear outlier in the PCA of the combined results
+
+PDX346_1187-21_CNTL_1R  
+
+```{r, message=F, error=F}
+
+# retrieve the TMM normalized data & select all the DEGs
+# these are TMM normalized on all genes!! 
+data.all.DEG <- (combined.raw.norm[rownames(res.comb.DFSign.pt.sens),])
+
+# remove outlier
+data.all.DEG <- data.all.DEG[,!colnames(data.all.DEG) %in% "PDX346_1187-21_CNTL_1R"]
+
+# 1073 DEGs for 55 samples
+dim(data.all.DEG)
+
+# scale the data
+data.all.DEG.scaled <- scale(t(data.all.DEG))
+
+
+# remove the bad sample from the sample data
+sample.rm <- sample.all[!rownames(sample.all) %in% "PDX346_1187-21_CNTL_1R", ]
+
+# retrieve  the response
+response <- sample.rm$response
+
+# make numeric
+response <- ifelse(response=="Sensitive", 0, 1)
+
+# add the response variable as first column
+data.all.DEG.scaled <- cbind(response, data.all.DEG.scaled)
+
+# order the data sensitive first then resistant
+data.processed <- data.all.DEG.scaled[order(data.all.DEG.scaled[,1], decreasing = TRUE),]
+
+dim(data.processed)
+
+data.processed[1:4,1:4]
+
+```
+# Hallmark genes model
+
+Similar approach than the MOTERA paper. 
+
+```{r, message=F, error=F, eval = F}
+genes.deseq.pt <- rownames(res.comb.DFSign.pt.sens)
+
+goi <- as.data.frame(em.deseq.pt)
+
+goi.early <- goi[1,8]
+goi.late <- goi[2,8]
+goi.emt <- goi[4,8]
+
+
+goi.early <- str_split_1(goi.early, "\\/")
+goi.late <- str_split_1(goi.late, "\\/")
+goi.emt <- str_split_1(goi.emt, "\\/")
+
+features <- c(goi.early,goi.late,goi.emt) # total 112 features
+
+features <- unique(features) # 88 unique genes between the 3 Hallmarks
+
+data.processed[1:5,1:4]
+
+# only select the 14 features
+data.lasso <- cbind(data.processed[,1], data.processed[,features])
+
+f = length(features) # selected features and class label 
+# Create folds
+num_folds <- 4
+
+# you can see that the folds now nicely contain 2 sensitive samples in each
+folds <- createFolds(as.factor(data.lasso[,1]), k = num_folds, returnTrain = F)
+
+# for loop to fit model and calculate CR for each fold                  
+CRs <- c()
+CRs.svm <- c()
+CRs.rf <- 0
+
+conf_matrix <- 0
+conf_matrix.svm <- 0
+conf_matrix.rf <- 0
+
+overall_matrix <- 0
+overall_matrix.svm <- 0
+overall_matrix.rf <- 0
+
+Fs.nnet <- 0
+data.ord <- data.lasso
+
+for (i in 1:num_folds) {
+  test_idx <- folds[[i]] # this selects which 10 rows/samples you take
+  test_data <- data.ord[test_idx, ]  # take the 10 to test
+  train_data <- data.ord[-test_idx, ] # take the other 96 to train
+  
+  
+  # true labels
+  true = round(test_data[,1])
+  
+  
+  # Train the model on the training data
+  # NNET
+  model <- nnet(train_data[,2:(f+1)], train_data[,1], 
+                size=1, rang=0.1, 
+                decay = 5e-4, 
+                maxit= 2000)
+  
+  
+  predictions <- round(predict(model, newdata = test_data[,-1]))
+  
+  conf_matrix <- confusionMatrix(as.factor(predictions),
+                                 as.factor(true))
+  F.nnet <- F_meas(as.factor(predictions),
+                                 as.factor(true))
+  
+  
+  overall_matrix <- overall_matrix + conf_matrix$table
+  
+  
+  
+  # RANDOM FOREST
+  rf_model <- randomForest(train_data[,2:(f+1)], 
+                           train_data[,1], 
+                           ntree = 50, 
+                           mtry = sqrt(ncol(train_data)))
+  
+  
+  # Generate predictions on the test data
+  # RF
+  predictions.rf <- as.matrix(round(predict(rf_model, 
+                                  newdata = test_data[,-1])))
+  
+
+  
+  conf_matrix.rf <- confusionMatrix(as.factor(predictions.rf),
+                                    as.factor(true))
+
+  
+  overall_matrix.rf <- overall_matrix.rf + conf_matrix.rf$table
+  
+
+  # SVM ------------------------------------------------------------
+  model.svm = svm(train_data[,2:(f+1)], 
+                     train_data[,1], 
+                     method = "C-classification")
+  
+  
+  # Predictions
+  
+  predictions.svm <- round(predict(model.svm, 
+                                      newdata = test_data[,-1]))
+ 
+  conf_matrix.svm <- confusionMatrix(as.factor(predictions.svm),
+                                     as.factor(true))
+  
+  # # F.svm <- F_meas(as.factor(predictions.svm),
+  #                                    as.factor(true))
+  # 
+  
+  overall_matrix.svm <- overall_matrix.svm + conf_matrix.svm$table
+  
+  
+  # Calculate the classification rate for the fold
+  accuracy.nnet <- conf_matrix$overall["Accuracy"]
+  accuracy.svm <- conf_matrix.svm$overall["Accuracy"]
+  accuracy.rf <- conf_matrix.rf$overall["Accuracy"]
+
+  CRs <- c(CRs, accuracy.nnet)
+  CRs.svm <- c(CRs.svm, accuracy.svm)
+  CRs.rf <- c(CRs.rf, accuracy.rf)
+  
+  #Fs.svm <- c(Fs.svm, F.svm)
+  Fs.nnet <- c(Fs.nnet, F.nnet)
+  #Fs.rf <- c(Fs.rf, F.rf)
+  
+}
+
+# Average the results to obtain cross-validated classification rate
+# accuracy nnet
+mean(CRs)
+# accuracy svm
+mean(CRs.svm)
+# accuracy rf
+mean(CRs.rf)
+
+selectivity = overall_matrix[2,2]/(overall_matrix[2,2]+overall_matrix[1,2])
+sensitivity = overall_matrix[1,1]/(overall_matrix[1,1]+overall_matrix[2,1])
+
+selectivity.svm = overall_matrix.svm[2,2]/(overall_matrix.svm[2,2]+overall_matrix.svm[1,2])
+sensitivity.svm = overall_matrix.svm[1,1]/(overall_matrix.svm[1,1]+overall_matrix.svm[2,1])
+
+# Print the confusion matrix
+# nnet
+print(overall_matrix)
+# rf
+print(overall_matrix.rf)
+# svm linear
+print(overall_matrix.svm)
+
+# print sensitivity
+#nnet
+print(sensitivity)
+
+#svm
+print(sensitivity.svm)
+
+```
+
+These are the 88 features
+
+```{r}
+features <- c(
+    "CA2", "ST6GALNAC2", "RET", "IL17RB", "EGR3", "TFF3", "SERPINA1", "CXCL14", "DYNLT3", "SERPINA5",
+    "UGDH", "IL6ST", "TST", "CPE", "SLC24A3", "SLC1A4", "KCNK5", "SCNN1A", "LTF", "GJB3",
+    "SFN", "IGFBP4", "CD9", "SERPINA3", "FGFR3", "SLC7A5", "TFF1", "FRK", "SCUBE2", "TSPAN13",
+    "ANXA9", "FOXC1", "PAPSS2", "DHRS2", "AGR2", "IDH2", "PDCD4", "PDLIM3", "ABHD2", "ISG20",
+    "SIAH2", "SLC29A1", "DNAJC12", "INHBB", "TMEM164", "REEP1", "PODXL", "RASGRP1", "KCNK15", "MYBL1",
+    "KRT15", "AQP3", "CBFA2T3", "B4GALT1", "ADCY9", "NAV2", "MSMB", "MLPH", "TGM2", "RARA",
+    "VCAN", "FZD8", "MGP", "ITGB5", "ANPEP", "FBLN1", "LAMC1", "FN1", "TGFBR3", "PMP22",
+    "MATN3", "WNT5A", "OXTR", "IGFBP2", "THBS1", "IGFBP3", "BDNF", "DPYSL3", "ELN", "VEGFC",
+    "COL12A1", "FAS", "BASP1", "COL1A1", "SFRP1", "FBN2", "COL4A2", "SDC4"
+)
+
+```
+
+
+
+# LASSO
+
+- check parameters stringency
+ -> optimal Lambda (stringency of shrinkage) is automatically found via cross     validation so no need to optimize parameters.
+  two options: lambda.min (less stringent) & lambda.min+1se (stringent)
+  
+Lets do both options and see the resulting features.
+
+## lambda.min+1se (stringent)
+    
+```{r, eval = F}
+X <- as.matrix(data.processed[,-1]) 
+Y <- data.processed[,1]
+
+# Define a vector or list to store the selected gene names for each iteration
+selected_genes_list <- vector("list", 1000)
+
+
+for (i in 1:1000) {
+  set.seed(i)  # Set a different random seed for each iteration
+  
+  # Fit LASSO model
+  mlasso <- glmnet(X, Y, standardize = FALSE, alpha = 1)  # LASSO: alpha=1
+  # with alpha = 1, it does LASSO and not elastic-net or ridge!
+  
+  # CV to estimate the most optimal value of lambda
+  cv.lasso <- cv.glmnet(X, Y, standardize = FALSE)
+  
+  # Assuming 'mlasso' is your fitted LASSO model
+  selected_genes <- which(coef(mlasso, s = cv.lasso$lambda.1se)[-1, ] != 0)
+  
+  if (length(selected_genes) > 0) {
+      print(i)
+  }
+
+  
+  # Store the selected gene names in the list
+  selected_genes_list[[i]] <- selected_genes
+  
+}
+
+# Now you have a list (selected_genes_list) containing the selected gene names for each iteration
+
+# Combine all the gene names from the list into a single vector
+all_genes <- unlist(selected_genes_list)
+
+# Use the table function to get the frequency of each gene in the list
+gene_frequency <- table(all_genes)
+
+# Sort the result in descending order
+gene_frequency_sorted <- sort(gene_frequency, decreasing = TRUE)
+
+# Sample data
+data <- data.frame(
+  gene = colnames(X)[as.numeric(names(gene_frequency_sorted))],
+  frequency = gene_frequency_sorted)
+
+sorted_data <- arrange(data, desc(data$frequency.Freq))
+# Convert "gene" column to a factor with the desired order
+sorted_data$gene <- factor(sorted_data$gene, levels = sorted_data$gene)
+
+
+# Create the barplot with rotated labels
+barplot_plot <- ggplot(sorted_data, aes(x = gene, y = frequency.Freq)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("Gene name") +
+  ylab("Frequency") +
+  
+
+# Display the plot
+print(barplot_plot)
+
+# Save the barplot as a PNG file
+ggsave("bar_plot_plus1se.png", barplot_plot, width = 8, height = 6, dpi = 300)
+
+
+# these are the names of most frequent named genes after 1000 iterations
+selected.features.1se <- data$gene
+
+# the data for the first 5 samples
+X[1:5,selected.features.1se]
+
+selected_genes_list[[114]]
+```
+
+## lambda.min (relaxed)
+
+```{r, eval = F}
+library(glmnet)
+
+X <- as.matrix(data.processed[,-1]) 
+Y <- data.processed[,1]
+
+# Define a vector or list to store the selected gene names for each iteration
+selected_genes_list <- vector("list", 1000)
+
+
+for (i in 1:1000) {
+  set.seed(i)  # Set a different random seed for each iteration
+  
+  # Fit LASSO model
+  mlasso <- glmnet(X, Y, standardize = FALSE, alpha = 1)  # LASSO: alpha=1
+  # with alpha = 1, it does LASSO and not elastic-net or ridge!
+  
+  # CV to estimate the most optimal value of lambda
+  cv.lasso <- cv.glmnet(X, Y, standardize = FALSE)
+  
+  # Assuming 'mlasso' is your fitted LASSO model
+  selected_genes <- which(coef(mlasso, s = cv.lasso$lambda.min)[-1, ] != 0)
+  
+  # Store the selected gene names in the list
+  selected_genes_list[[i]] <- selected_genes
+  
+}
+
+# Now you have a list (selected_genes_list) containing the selected gene names for each iteration
+
+# Combine all the gene names from the list into a single vector
+all_genes <- unlist(selected_genes_list)
+
+# Use the table function to get the frequency of each gene in the list
+gene_frequency <- table(all_genes)
+
+# Sort the result in descending order
+gene_frequency_sorted <- sort(gene_frequency, decreasing = TRUE)
+
+load("gene_frequency_sorted.RData")
+
+# Sample data
+data <- data.frame(
+  gene = colnames(X)[as.numeric(names(gene_frequency_sorted))],
+  frequency = gene_frequency_sorted)
+
+sorted_data <- arrange(data, desc(data$frequency.Freq))
+# Convert "gene" column to a factor with the desired order
+sorted_data$gene <- factor(sorted_data$gene, levels = sorted_data$gene)
+
+
+# Create the barplot with rotated labels
+barplot_plot <- ggplot(sorted_data, aes(x = gene, y = frequency.Freq)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("Gene name") +
+  ylab("Frequency") +
+  geom_hline(yintercept = 180, linetype = "dotted")
+
+# Display the plot
+print(barplot_plot)
+
+
+
+# Save the barplot as a PNG file
+ggsave("bar_plot_min.png", barplot_plot, width = 8, height = 6, dpi = 300)
+
+
+# these are the names of most frequent named genes after 1000 iterations
+selected.features.min <- data$gene
+
+# the data for the first 5 samples
+X[1:5,selected.features.min]
+
+data$gene
+
+```
+
+Load the genes here
+
+```{r}
+selected.features.relaxed <- c("SYCP2", "CCDC180", "SMIM14", "NEURL1", "TBX1", "SOX2", "GBP4", "NIPSNAP1", "RAB11FIP1", "ZNF92", "C2CD3", "RSF1", "PDGFB", "GRB10", "KLHL5", "DLL1", "KBTBD11", "DPF2", "TNNT1", "EYA2", "TMEM56", "MGP", "XK", "TACC1", "SCUBE2", "LONRF3", "GRPR", "ARC", "SHISA2", "CDC42EP3", "SFMBT2", "RNF169","IL1R1", "TRANK1", "NES", "MUC6", "HIST1H2AC", "KRT15", "SEMA5A", "ASPH", "DNAJC12", "IGFBP2", "CPNE5", "FLT3LG", "CHST1", "WNK4", "UBP1", "COX7A2L",  "SYT11", "GLOD5", "PTPRU", "FBXO2", "MRAS", "AMOTL1", "IL4R", "PLXNA4", "IRF9", "HIST1H2BK", "ZMAT4", "TOX3", "ZNF432", "BACE2", "PRKCH", "PHLDA2", "RNF165", "CYB5R2", "C2CD4C", "AMZ1", "SERPINA5", "WWC2", "SPDYC", "ABHD2", "MDFIC")
+
+
+```
+
+## top genes from relaxed
+
+```{r}
+selected.features.filtered <- c(
+  "SYCP2", "CCDC180", "SMIM14", "NEURL1", "TBX1",
+  "GBP4", "RAB11FIP1", "SOX2", "NIPSNAP1", "ZNF92",
+  "PDGFB", "C2CD3", "RSF1", "GRB10", "DLL1",
+  "KLHL5", "KBTBD11", "DPF2", "TMEM56", "TNNT1",
+  "EYA2", "MGP", "XK", "TACC1", "SCUBE2",
+  "LONRF3", "GRPR")
+
+intersect(selected.features.filtered, selected.features.relaxed)
+```
+
+The 27 genes from the relaxed lasso with highest frequencies!
+To simulate a model like the stringent one, but with the most predictive genes from the relaxed lasso instead of doing a LASSO with lambda.min+1s.e. since that one no longer gave results...
+
+# intersect both lists
+
+```{r}
+intersect(selected.features.stringent, selected.features.relaxed)
+
+```
+
+All the 29 genes from the stringent LASSO are in the 74 genes from the relaxed LASSO, which is expected. 
+
+Let's create models based on both sets and see which performs better, because if equal performance lower amount of genes is preferable for clinical practice.  
+
+
+
+# Venn Feature Sets
+
+Let's create a Venn diagram of the genes of the different features sets: MOTERA-genes, our genes via MOTERA, Relaxed, Filtered 
+
+```{r}
+genes.MOTERA <- c(
+  "CHST8", "MAPT", "OLFM1", "PDZK1", "RASGRP1",
+  "MPPED2", "GREB1", "MYB", "GFRA1", "PGR",
+  "ELOVL2", "ADCY1", "NPY1R", "TFF1", "ACOX2",
+  "SGK1", "STC2", "CALCR", "KRT13", "VCAN", "COL3A1","CXCL12", "GJA1", "TGM2")
+
+genes.hallmarks <- features
+
+intersect(genes.MOTERA, genes.hallmarks)
+
+intersect(selected.features.relaxed, genes.MOTERA)
+
+intersect(selected.features.relaxed, genes.hallmarks)
+
+library(VennDiagram)
+
+# Prepare a palette of 3 colors with R colorbrewer:
+library(RColorBrewer)
+myCol <- brewer.pal(3, "Pastel2")
+
+# Chart
+venn.diagram(
+        x = list(genes.MOTERA, genes.hallmarks, selected.features.relaxed),
+        category.names = c("MOTERA" , "Hallmark-selected" , "LASSO-selected"),
+        filename = 'venndiagramm.png',
+        output=TRUE,
+        
+        # Output features
+        imagetype="png" ,
+        height = 480 , 
+        width = 600 , 
+        resolution = 300,
+        compression = "lzw",
+        
+        # Circles
+        lwd = 2,
+        lty = 'blank',
+        fill = myCol,
+        
+        # Numbers
+        cex = .4,
+        fontface = "bold",
+        fontfamily = "sans",
+        
+        # Set names
+        cat.cex = 0.3,
+        cat.fontface = "bold",
+        cat.default.pos = "outer",
+        cat.pos = c(-27, 0, -200),
+        cat.dist = c(0.055, 0.055, 0.085),
+        cat.fontfamily = "sans",
+        rotation = 1
+)
+
+```
+
+
+# Model training
+
+Let's train different Machine Learning models with the two sets of LASSO-selected features, the relaxed and stringent selected genes.
+
+## Load models
+
+To have stable results
+
+```{r}
+model.relaxed <- readRDS("nnet_relaxed.rds")
+model.filtered <- readRDS("nnet_filtered.rds")
+model.stringent <- readRDS("nnet_stringent.rds")
+```
+
+## Relaxed LASSO genes
+
+Let's recreate model with these 74 genes after 1000 iterations. Lambda.min, lower penalty term, more genes selected.
+
+```{r, message=F, error=F, warning=F, eval = F}
+set.seed(2)
+
+# data with outlier removed
+# these are all the DEG from the combined data
+# TMM normalized and scaled! 
+# with the response variable in the first column
+# the LASSO is also based on this data!
+data.processed[1:5,1:4]
+
+# only select the 14 features
+data.lasso <- cbind(data.processed[,1], data.processed[,selected.features.relaxed])
+
+f = length(selected.features.relaxed) # selected features and class label 
+# Create folds
+num_folds <- 4
+
+# you can see that the folds now nicely contain 2 sensitive samples in each
+folds <- createFolds(as.factor(data.lasso[,1]), k = num_folds, returnTrain = F)
+
+# for loop to fit model and calculate CR for each fold                  
+CRs <- c()
+CRs.svm <- c()
+CRs.rf <- 0
+
+conf_matrix <- 0
+conf_matrix.svm <- 0
+conf_matrix.rf <- 0
+
+overall_matrix <- 0
+overall_matrix.svm <- 0
+overall_matrix.rf <- 0
+
+misclassified.vector <- c()
+
+data.ord <- data.lasso
+
+for (i in 1:num_folds) {
+  test_idx <- folds[[i]] # this selects which 10 rows/samples you take
+  test_data <- data.ord[test_idx, ]  # take the 10 to test
+  train_data <- data.ord[-test_idx, ] # take the other 96 to train
+  
+  
+  # true labels
+  true = round(test_data[,1])
+  
+  
+  # Train the model on the training data
+  # NNET
+  model <- nnet(train_data[,2:(f+1)], train_data[,1], 
+                size=1, rang=0.1, 
+                decay = 5e-4, 
+                maxit= 2000)
+  
+  
+  predictions <- round(predict(model, newdata = test_data[,-1]))
+  
+  conf_matrix <- confusionMatrix(as.factor(predictions),
+                                 as.factor(true))
+  overall_matrix <- overall_matrix + conf_matrix$table
+  
+  
+  
+  # RANDOM FOREST
+  rf_model <- randomForest(train_data[,2:(f+1)], 
+                           train_data[,1], 
+                           ntree = 20, 
+                           mtry = sqrt(ncol(train_data)))
+  
+  
+  # Generate predictions on the test data
+  # RF
+  predictions.rf <- round(predict(rf_model, 
+                                  newdata = test_data[,-1]))
+  
+
+  
+  conf_matrix.rf <- confusionMatrix(as.factor(predictions.rf),
+                                    as.factor(true))
+  
+  overall_matrix.rf <- overall_matrix.rf + conf_matrix.rf$table
+  
+  
+  # SVM ------------------------------------------------------------
+  model.svm = svm(train_data[,2:(f+1)], 
+                     train_data[,1], 
+                     method = "C-classification")
+  
+  
+  # Predictions
+  
+  predictions.svm <- round(predict(model.svm, 
+                                      newdata = test_data[,-1]))
+  
+  # Find the indices of missclassified sensitive samples
+  misclassified_indices <- which(true == 1 & predictions.svm == 0)
+
+  # save them for each fold
+  misclassified.vector <- c(misclassified.vector, names(misclassified_indices))
+
+  
+  
+ 
+  conf_matrix.svm <- confusionMatrix(as.factor(predictions.svm),
+                                     as.factor(true))
+  overall_matrix.svm <- overall_matrix.svm + conf_matrix.svm$table
+  
+  
+  # Calculate the classification rate for the fold
+  accuracy.nnet <- conf_matrix$overall["Accuracy"]
+  accuracy.svm <- conf_matrix.svm$overall["Accuracy"]
+  accuracy.rf <- conf_matrix.rf$overall["Accuracy"]
+
+  CRs <- c(CRs, accuracy.nnet)
+  CRs.svm <- c(CRs.svm, accuracy.svm)
+  CRs.rf <- c(CRs.rf, accuracy.rf)
+  
+  
+}
+
+# Average the results to obtain cross-validated classification rate
+mean(CRs)
+mean(CRs.svm)
+mean(CRs.rf)
+
+# Print the confusion matrix
+print(overall_matrix)
+
+selectivity = overall_matrix[2,2]/(overall_matrix[2,2]+overall_matrix[1,2])
+sensitivity = overall_matrix[1,1]/(overall_matrix[1,1]+overall_matrix[2,1])
+
+selectivity.svm = overall_matrix.svm[2,2]/(overall_matrix.svm[2,2]+overall_matrix.svm[1,2])
+sensitivity.svm = overall_matrix.svm[1,1]/(overall_matrix.svm[1,1]+overall_matrix.svm[2,1])
+
+# sensitivity
+# svm
+print(sensitivity.svm)
+# nnet
+print(sensitivity)
+
+# rf
+print(overall_matrix.rf)
+
+# Print the confusion matrix
+# svm linear
+print(overall_matrix.svm)
+
+print(overall_matrix)
+
+model.relaxed <- model
+
+# Assuming 'model' is your neural network model
+#saveRDS(model.relaxed, file = "nnet_relaxed.rds", version = 2)
+
+
+
+```
+
+## filtered top LASSO genes
+
+Let's recreate model with these 74 genes after 1000 iterations. Lambda.min, lower penalty term, more genes selected.
+
+```{r, message=F, error=F, warning=F, eval = F}
+set.seed(2)
+
+# data with outlier removed
+# these are all the DEG from the combined data
+# TMM normalized and scaled! 
+# with the response variable in the first column
+# the LASSO is also based on this data!
+data.processed[1:5,1:4]
+
+# only select the 14 features
+data.lasso <- cbind(data.processed[,1], data.processed[,selected.features.filtered])
+
+f = length(selected.features.filtered) # selected features and class label 
+# Create folds
+num_folds <- 4
+
+# you can see that the folds now nicely contain 2 sensitive samples in each
+folds <- createFolds(as.factor(data.lasso[,1]), k = num_folds, returnTrain = F)
+
+# for loop to fit model and calculate CR for each fold                  
+CRs <- c()
+CRs.svm <- c()
+CRs.rf <- 0
+
+conf_matrix <- 0
+conf_matrix.svm <- 0
+conf_matrix.rf <- 0
+
+overall_matrix <- 0
+overall_matrix.svm <- 0
+overall_matrix.rf <- 0
+
+misclassified.vector <- c()
+
+data.ord <- data.lasso
+
+for (i in 1:num_folds) {
+  test_idx <- folds[[i]] # this selects which 10 rows/samples you take
+  test_data <- data.ord[test_idx, ]  # take the 10 to test
+  train_data <- data.ord[-test_idx, ] # take the other 96 to train
+  
+  
+  # true labels
+  true = round(test_data[,1])
+  
+  
+  # Train the model on the training data
+  # NNET
+  model <- nnet(train_data[,2:(f+1)], train_data[,1], 
+                size=1, rang=0.1, 
+                decay = 5e-4, 
+                maxit= 4000)
+  
+  
+  predictions <- round(predict(model, newdata = test_data[,-1]))
+  
+  conf_matrix <- confusionMatrix(as.factor(predictions),
+                                 as.factor(true))
+  overall_matrix <- overall_matrix + conf_matrix$table
+  
+  
+  
+  # RANDOM FOREST
+  rf_model <- randomForest(train_data[,2:(f+1)], 
+                           train_data[,1], 
+                           ntree = 100, 
+                           mtry = sqrt(ncol(train_data)))
+  
+  
+  # Generate predictions on the test data
+  # RF
+  predictions.rf <- round(predict(rf_model, 
+                                  newdata = test_data[,-1]))
+  
+
+  
+  conf_matrix.rf <- confusionMatrix(as.factor(predictions.rf),
+                                    as.factor(true))
+  
+  overall_matrix.rf <- overall_matrix.rf + conf_matrix.rf$table
+  
+  
+  # SVM ------------------------------------------------------------
+  model.svm = svm(train_data[,2:(f+1)], 
+                     train_data[,1], 
+                     method = "C-classification")
+  
+  
+  # Predictions
+  
+  predictions.svm <- round(predict(model.svm, 
+                                      newdata = test_data[,-1]))
+  
+  # Find the indices of missclassified sensitive samples
+  misclassified_indices <- which(true == 1 & predictions.svm == 0)
+
+  # save them for each fold
+  misclassified.vector <- c(misclassified.vector, names(misclassified_indices))
+
+  
+  
+ 
+  conf_matrix.svm <- confusionMatrix(as.factor(predictions.svm),
+                                     as.factor(true))
+  overall_matrix.svm <- overall_matrix.svm + conf_matrix.svm$table
+  
+  
+  # Calculate the classification rate for the fold
+  accuracy.nnet <- conf_matrix$overall["Accuracy"]
+  accuracy.svm <- conf_matrix.svm$overall["Accuracy"]
+  accuracy.rf <- conf_matrix.rf$overall["Accuracy"]
+
+  CRs <- c(CRs, accuracy.nnet)
+  CRs.svm <- c(CRs.svm, accuracy.svm)
+  CRs.rf <- c(CRs.rf, accuracy.rf)
+  
+  
+}
+
+# Average the results to obtain cross-validated classification rate
+mean(CRs)
+mean(CRs.svm)
+mean(CRs.rf)
+
+# Print the confusion matrix
+print(overall_matrix)
+
+selectivity = overall_matrix[2,2]/(overall_matrix[2,2]+overall_matrix[1,2])
+sensitivity = overall_matrix[1,1]/(overall_matrix[1,1]+overall_matrix[2,1])
+
+selectivity.svm = overall_matrix.svm[2,2]/(overall_matrix.svm[2,2]+overall_matrix.svm[1,2])
+sensitivity.svm = overall_matrix.svm[1,1]/(overall_matrix.svm[1,1]+overall_matrix.svm[2,1])
+
+# sensitivity
+# svm
+print(sensitivity.svm)
+# nnet
+print(sensitivity)
+
+# rf
+print(overall_matrix.rf)
+
+# Print the confusion matrix
+# svm linear
+print(overall_matrix.svm)
+
+print(overall_matrix)
+
+model.filtered <- model
+
+saveRDS(model.filtered, file = "nnet_filtered.rds", version = 2)
+
+
+
+```
+
+Again nnet gave the best results, since it is more important to classify the sensitive patients right than having an overall higher accuracy (svm has highest, but misclassify 2 sensitive patients)
+
+# New validation data
+
+```{r, eval = F}
+library(readr)
+RNAseq_raw_counts <- read_delim("RNAseq_raw_counts.txt", delim = "\t")
+
+RNAseq_raw_counts <- as.data.frame(RNAseq_raw_counts, row.names = RNAseq_raw_counts[,1])
+
+rownames(RNAseq_raw_counts) <- RNAseq_raw_counts[,1]
+
+RNAseq_raw_counts <- RNAseq_raw_counts[,-1]
+
+RNAseq_raw_counts <- t(RNAseq_raw_counts)
+
+RNAseq_raw_counts[1:5,1:5]
+
+class(RNAseq_raw_counts)
+
+range(RNAseq_raw_counts)
+
+save(RNAseq_raw_counts, file = "new_val_data.RData")
+```
+
+Just load the object
+
+```{r}
+load("new_val_data.RData")
+
+range(RNAseq_raw_counts)
+```
+
+## Sample data
+
+```{r}
+sample.data <- data.frame(patient = c("001-1", "006-1", "009-1", "010-1", "011-1", "012-1", "029-1P-1", "030-1P-2", "031-1P-1", "032-1P-1C", "033-1P-1", "034-1P-1", "035-1P-1"), response = rep("sensitive", 13))
+
+
+resistant <- as.character(c(13, 14 ,15, 16, 17, seq(18, 28, 1)))
+resistant <- paste0(0,resistant, sep = "")
+resistant <- paste(resistant, 1, sep = "-")
+resistant <- c("002-1","003-1", "004-1", "005-1" ,"007-1", "008-1",resistant) 
+
+res.data <- data.frame(patient = resistant, response = rep("resistant", 22))
+sample.data <- rbind(sample.data, res.data)
+
+sample.data
+```
+
+## Preprocess data
+
+TMM normalize the counts, and constructing training set. 
+
+```{r}
+used.samples <- intersect(colnames(RNAseq_raw_counts), sample.data$patient)
+
+# No sample 18 & 21, but not a problem since there is no data
+# of these samples before any treatment was received!! 
+
+# take the same genes as the training data is TMM-normalized for
+val.data.new <- RNAseq_raw_counts[intersect(rownames(combined.raw.norm), rownames(RNAseq_raw_counts)), used.samples]
+
+# select the samples used
+sample.data <- sample.data[sample.data$patient %in% used.samples,]
+
+# NORMALIZE  THE whole data set like the train data! 
+# actually to many genes already
+# Create a DGEList object
+val.data.new.dge <- DGEList(counts = val.data.new)
+
+# Perform TMM normalization
+val.data.new.dge <- calcNormFactors(val.data.new.dge, method = "TMM")
+
+# extract normalized reads
+val.data.new.norm <- cpm(val.data.new.dge)
+
+val.data.new.norm[1:4,1:4]
+
+# check if order is the same
+# double check if order is the same!! 
+val.data.new.norm <- val.data.new.norm[,order(colnames(val.data.new.norm))]
+
+sample.data <- sample.data[order(sample.data$patient),]
+
+sample.data$patient==colnames(val.data.new.norm)
+
+```
+
+## QC
+
+Let's do a quick QC before continuing with validation
+
+```{r}
+# Create a data frame for plotting
+plotData <- data.frame(Sample = colnames(val.data.new.dge$counts), LibrarySize = val.data.new.dge$samples$lib.size)
+
+# plot libary sizes
+ggplot(plotData, aes(x = Sample, y = LibrarySize)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Library Sizes", x = "Sample", y = "Library Size") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+```
+
+We see high fluctuations in library sizes! Shows the importance of TMM normalization.
+
+```{r}
+# Convert the data frame to a tibble for easier manipulation (if needed)
+norm.data_tibble <- as_tibble(log(val.data.new.norm+1))
+rownames(norm.data_tibble) <- rownames(val.data.new.norm)
+# Add row names as a column
+plot_data <- norm.data_tibble %>%
+  rownames_to_column(var = "Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "sample", values_to = "Expression")
+
+# Plot the expression distribution
+ggplot(plot_data, aes(x = sample, y = Expression)) +
+  geom_boxplot(color = "black") +
+  labs(x = "Sample", y = "Expression") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Aqual distribution after normalization!
+
+Let's do clustering
+
+```{r}
+# Perform hierarchical clustering on gene expression matrix
+
+hc <- hclust(dist(t(val.data.new.norm)), method = "ward.D2")
+
+# Plot the dendrogram with colored labels
+sample_colors <- ifelse(sample.data$response == "resistant", "blue","red")
+
+dend <- as.dendrogram(hc)
+sample_colors <- sample_colors[order.dendrogram(dend)]
+labels_colors(dend) <- sample_colors
+labels_cex(dend) <- 0.4
+plot(dend, main = "Dendrogram: ward.D2 of normalized expression data")
+legend("topright", 
+     legend = c("sensitive","resistant"), 
+     col = c("red", "blue"), 
+     pch = c(20,20), bty = "n",  pt.cex = 1.5, cex = 0.6 , 
+     text.col = "black", horiz = FALSE, inset = c(0, 0.1))
+
+```
+
+Resistant sample D15-1 is clustering separatly from the rest, one to keep in mind. 
+
+```{r PCA combined data, warning=F, error=F, message=F}
+combined.raw.matrix <- as.matrix(val.data.new.norm)
+
+pca.filt <- prcomp(t(combined.raw.matrix),scale. = F)
+summary(pca.filt)$importance[,c(1:3)]
+
+colnames(val.data.new.norm)
+sample.data$patient
+
+## Scores data
+scores2 <- data.frame(pca.filt$x[, c("PC1", "PC2")])
+scores2$class <- sample.data$response
+
+labels <- data.frame(pca.filt$x[, c("PC1", "PC2")])
+labels$class <- sample.data$patient
+
+
+scoresplot <- ggplot(data = scores2, aes(x = PC1, y = PC2, colour = class)) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste("PC1 (", round(summary(pca.filt)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste("PC2 (", round(summary(pca.filt)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + 
+  theme_bw() + 
+    geom_label(
+    label=labels$class, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T, cex = 1.5)
+scoresplot
+
+library(ggplot2)
+ggsave("pca_val_external.png", scoresplot, width = 12, height = 4, dpi = 300)
+```
+
+Also in the PCA we see that sample D15-1 is worrying. We could choose to exclude them.
+
+## Scaling
+
+```{r}
+
+# remove sample 015-1 !!!
+val.data.new.norm <- val.data.new.norm[,!colnames(val.data.new.norm) %in% c("015-1")]
+
+sample.data <- sample.data[!sample.data$patient %in% c("015-1"),]
+
+
+# select DEGs 
+# scale & transpose
+# previous data was also scaled after selecting the DEGs 
+val.data.new <- scale(t(val.data.new.norm[intersect(rownames(RNAseq_raw_counts), rownames(res.comb.DFSign.pt.sens)),]))
+
+# these genes are not in the external table
+# and the data is thus slightly scaled differently than the training data! 
+rownames(res.comb.DFSign.pt.sens)[!rownames(res.comb.DFSign.pt.sens) %in% rownames(RNAseq_raw_counts)]
+
+val.data.new[1:5,1:5]
+# not all 1072 genes are present
+dim(val.data.new)
+
+# double check if order is the same!! 
+sample.data$patient==rownames(val.data.new)
+
+
+# paste resistant to the transposed samples
+val.data.new.processed <- cbind(ifelse(sample.data$response=="sensitive", 0, 1), (val.data.new))
+
+val.data.new.processed[1:5,1:5]
+
+```
+
+## Select features
+
+
+### Relaxed
+
+```{r}
+
+# select genes of interest
+val.data.new.processed.relaxed <- cbind(val.data.new.processed[,1],val.data.new.processed[,selected.features.relaxed])
+
+val.data.new.processed.relaxed[1:5,1:5]
+
+```
+### filtered
+
+```{r}
+
+# select genes of interest
+val.data.new.processed.filtered <- cbind(val.data.new.processed[,1],val.data.new.processed[,selected.features.filtered])
+
+val.data.new.processed.filtered[1:5,1:5]
+
+```
+
+
+## External validation
+
+
+
+### Relaxed
+
+```{r}
+
+# Generate predictions on the test data
+predictions <- round(predict(model.relaxed, newdata = val.data.new.processed.relaxed[,-1]))
+
+# true labels
+true <- round(val.data.new.processed.relaxed[,1])
+
+# model nnet
+conf.final <- confusionMatrix(as.factor(predictions),as.factor(true))
+
+rownames(predictions)[predictions==0 & true==1]
+
+conf.final$overall["Accuracy"]
+
+conf.final$table
+
+precision.final <- precision(as.factor(predictions),as.factor(true))
+
+print(precision.final)
+
+recall.final <- recall(as.factor(predictions),as.factor(true))
+
+print(recall.final)
+
+F1.final <- F_meas(as.factor(predictions),as.factor(true))
+
+print(F1.final)
+
+```
+
+### filtered
+
+```{r}
+
+# Generate predictions on the test data
+predictions <- round(predict(model.filtered, newdata = val.data.new.processed.filtered[,-1]))
+
+# true labels
+true <- round(val.data.new.processed.filtered[,1])
+
+# model nnet
+conf.final <- confusionMatrix(as.factor(predictions),as.factor(true))
+
+rownames(predictions)[predictions==0 & true==1]
+
+conf.final
+
+conf.final$table
+
+F_meas.final.stringent <- F_meas(as.factor(predictions),as.factor(true))
+
+F_meas.final.stringent
+
+precision.final.stringent <- recall(as.factor(predictions),as.factor(true), relevant = as.factor(1))
+precision.final.stringent
+
+
+```
+
+
+Both models show the same 'bad' accuracy after classification... 
+
+Let's try to validate with summed counts pseudo bulk from the single cell data. 
+
+# Summed Pseudobulk
+
+## Preprocess
+
+```{r}
+load("summed_pseudo_bulk.RData")
+
+sums.per.patients[1:5,1:5]
+
+# Patient 15 & 16 are already removed 
+dim(sums.per.patients)
+
+# these three genes are not in the validation data...
+
+selected.features.relaxed[!selected.features.relaxed %in% rownames(sums.per.patients)]
+
+# [1] "XK"     "FLT3LG" "IRF9" 
+
+selected.features.stringent[!selected.features.stringent %in% rownames(sums.per.patients)]
+
+# [1] "XK"
+
+# NORMALIZE  THE whole data set like the train data! 
+# actually to many genes already
+# Create a DGEList object
+val.data.sum.dge <- DGEList(counts = sums.per.patients)
+
+# Perform TMM normalization
+val.data.sum.dge <- calcNormFactors(val.data.sum.dge, method = "TMM")
+
+# extract normalized reads
+val.data.sum.norm <- cpm(val.data.sum.dge)
+
+# select DEGs 
+# scale & transpose
+# previous data was also scaled after selecting the DEGs 
+val.data.sum <- scale(t(val.data.sum.norm[intersect(rownames(val.data.sum.norm), rownames(res.comb.DFSign.pt.sens)),]))
+```
+
+## sample data 
+
+Same as the other pseudo bulk but without p15 & p16
+
+```{r}
+load("patient_data_pseudo_bulk.RData")
+
+patient.data[,3] <- ifelse(patient.data[,3]==1, 0,1) 
+
+patient.data <- patient.data[-c(2,3),]
+
+samples.val.data.sum <- patient.data$Y
+
+```
+
+## External validation
+
+
+### Relaxed
+
+Reload the val.data.sum first!! it should be fixed now
+
+```{r}
+
+# select genes
+val.data.sum.relaxed <- val.data.sum[,intersect(selected.features.relaxed, colnames(val.data.sum))]
+
+# Generate predictions on the test data
+predictions <- round(predict(model.relaxed, newdata = val.data.sum.relaxed))
+
+# true labels
+true <- round(samples.val.data.sum)
+
+# model nnet
+conf.final <- confusionMatrix(as.factor(predictions),as.factor(true))
+
+conf.final
+```
+
+The relaxed model with more genes performs better after validation. 
+
+### Filtered
+
+```{r}
+# select genes 
+
+val.data.sum.filtered <- val.data.sum[,intersect(selected.features.filtered, colnames(val.data.sum))]
+
+# Generate predictions on the test data
+predictions <- round(predict(model.filtered, newdata = val.data.sum.filtered))
+
+#predictions <- ifelse(is.na(predictions), 0, 1)
+
+# true labels
+true <- round(samples.val.data.sum)
+
+# model nnet
+conf.final <- confusionMatrix(as.factor(predictions),as.factor(true))
+
+conf.final
+```
+
+
+# Single cell Data
+
+Preprocess
+
+## Relaxed
+
+```{r, warning=F, message=F}
+library(Seurat)
+load(file = "seurat_validation.RData")
+
+# only 1015 features
+seurat.deg <- seurat.validation[rownames(res.comb.DFSign.pt.sens),]
+
+exp.matrix.deg <- as.matrix(seurat.deg@assays[["RNA"]]@counts)
+
+exp.matrix.deg[1:5,1:5]
+
+response <- as.data.frame(Idents(seurat.validation))
+
+response$patient <- rownames(response)
+
+# make labels the same to check if they correspond
+response$patient <- gsub("P", "",substring(response$patient,1,3))
+
+response$`Idents(seurat.validation)` <- ifelse(response$`Idents(seurat.validation)`== "Response", 0, 1)
+
+val.data.single.cell.deg <- cbind(response$`Idents(seurat.validation)`, t(exp.matrix.deg))
+
+
+# two genes from the relaxed are not in the single cell data... 
+dim(val.data.single.cell.deg)
+
+val.data.single.cell.deg[3000:3005,1:2]
+# double check, indeed patient 20 is non-responder = 1
+
+val.data.single.cell.deg[1:5,1:2]
+# double check, indeed patient 14 is responder = 0
+```
+
+
+As you can see two genes are not present in the validation single cell data, for a neural network model this doesn't bother but for the SVM this cannot be used for validation, since the model is trained based on all the 74 genes... 
+
+Do the same for the stringent genes. 
+
+First preprocess, remove p15  & 16, TMM & scale
+
+```{r}
+
+filtered_matrix <- val.data.single.cell.deg[!grepl("^P15|^P16", rownames(val.data.single.cell.deg)), ]
+
+dim(filtered_matrix)
+
+val.data.sc.dge <- DGEList(counts = t(filtered_matrix[,-1]))
+
+# Perform TMM normalization
+val.data.sc.dge <- calcNormFactors(val.data.sc.dge, method = "TMM")
+
+# extract normalized reads
+val.data.sc.norm <- cpm(val.data.sc.dge)
+dim(val.data.sc.norm)
+# select DEGs 
+# scale & transpose
+# previous data was also scaled after selecting the DEGs 
+val.data.sc <- scale(t(val.data.sc.norm))
+
+val.data.sc[1:5,1:5]
+
+```
+
+### Valid Relaxed
+
+
+```{r, eval = F}
+dim(val.data.sc)
+# select wanted features first 
+
+val.data.sc.relaxed <- val.data.sc[,intersect(selected.features.relaxed, colnames(val.data.sc))]
+
+
+# Assuming you have a total of n samples
+n <- nrow(val.data.sc.relaxed)
+
+# Set the batch size
+batch_size <- 1600
+
+# Initialize an empty vector to store predictions
+all_predictions <- vector("list", length = n)
+
+# Loop through the data in batches
+for (i in seq(1, n, by = batch_size)) {
+  # Determine the start and end indices for the current batch
+  start_idx <- i
+  end_idx <- min(i + batch_size - 1, n)
+  
+  # Extract the current batch of data
+  batch_data <- val.data.sc.relaxed[start_idx:end_idx, ]
+  
+  # Make predictions for the current batch
+  batch_predictions <- round(predict(model.relaxed, newdata = batch_data[, ]))
+  
+  # Store the predictions in the corresponding indices
+  all_predictions[start_idx:end_idx] <- batch_predictions
+}
+
+# Convert the list of predictions into a vector
+all_predictions <- unlist(all_predictions)
+
+
+conf.final <- confusionMatrix(factor(all_predictions), factor(filtered_matrix[,1]))
+
+conf.final
+```
+
+### Valid Filtered
+
+
+```{r, eval = F}
+dim(val.data.sc)
+# select wanted features first 
+
+val.data.sc.filtered <- val.data.sc[,intersect(selected.features.filtered, colnames(val.data.sc))]
+
+# Assuming you have a total of n samples
+n <- nrow(val.data.sc.filtered)
+
+# Set the batch size
+batch_size <- 2000
+
+# Initialize an empty vector to store predictions
+all_predictions <- vector("list", length = n)
+
+# Loop through the data in batches
+for (i in seq(1, n, by = batch_size)) {
+  # Determine the start and end indices for the current batch
+  start_idx <- i
+  end_idx <- min(i + batch_size - 1, n)
+  
+  # Extract the current batch of data
+  batch_data <- val.data.sc.filtered[start_idx:end_idx, ]
+  
+  # Make predictions for the current batch
+  batch_predictions <- round(predict(model.filtered, newdata = batch_data[, ]))
+  
+  # Store the predictions in the corresponding indices
+  all_predictions[start_idx:end_idx] <- batch_predictions
+}
+
+# Convert the list of predictions into a vector
+all_predictions <- unlist(all_predictions)
+
+
+# model nnet
+conf.final <- confusionMatrix(as.factor(all_predictions),as.factor(filtered_matrix[,1]))
+
+conf.final
+```
+
+# Pseudo bulk
+
+```{r, warning=F, message=F}
+# set back the idents to the original idents, and calculate again 
+Idents(object = seurat.validation) <- seurat.validation[["orig.ident"]]
+
+averaged_expr_sample <- AverageExpression(seurat.validation, by = "sample")
+
+range(data.frame(averaged_expr_sample))
+
+pseudo.bulk <- data.frame(averaged_expr_sample)
+
+head(pseudo.bulk)
+
+dim(pseudo.bulk)
+
+```
+
+## preprocess 
+
+```{r, message= F, warning=F}
+val.data.all <- pseudo.bulk
+
+range(val.data.all)
+
+# Create a DGEList object
+val.data.dge <- DGEList(counts = val.data.all)
+
+# Perform TMM normalization
+val.data.dge <- calcNormFactors(val.data.dge, method = "TMM")
+
+# extract normalized reads
+val.data.norm <- cpm(val.data.dge)
+
+# scale but first select the DEGs! 
+val.data <- scale(t(val.data.norm[intersect(rownames(res.comb.DFSign.pt.sens), rownames(val.data.norm)),-c(2,3)]))
+
+dim(val.data)
+
+load("processed_pseudobulk.RData")
+
+rownames(val.data)
+
+# select features
+val.data.relaxed <- val.data[,intersect(colnames(val.data), selected.features.relaxed)]
+val.data.stringent <- val.data[,intersect(colnames(val.data), selected.features.stringent)]
+val.data.filtered <- val.data[,intersect(colnames(val.data), selected.features.filtered)]
+
+# first have to fix the orders of the samples
+val.data.relaxed <- cbind(patient.data$Y,val.data.relaxed[,])
+dim(val.data.relaxed)
+
+# first have to fix the orders of the samples
+val.data.stringent <- cbind(patient.data$Y,val.data.stringent[,])
+dim(val.data.stringent)
+
+val.data.filtered <- cbind(patient.data$Y,val.data.filtered[,])
+dim(val.data.filtered)
+
+
+```
+
+```{r, message=F, error=F}
+
+predictions.relaxed <- round(predict(model.relaxed, newdata = val.data.relaxed[,-1]))
+
+predictions.stringent <- round(predict(model.stringent, newdata = val.data.stringent[,-1]))
+
+predictions.filtered <- round(predict(model.filtered, newdata = val.data.filtered[,-1]))
+
+
+# true labels
+true <- round(val.data.relaxed[,1])
+
+# model nnet
+conf.final.relaxed <- confusionMatrix(as.factor(predictions.relaxed),as.factor(true))
+
+
+
+conf.final.stringent <- confusionMatrix(as.factor(predictions.stringent),as.factor(true))
+
+conf.final.filtered <- confusionMatrix(as.factor(predictions.filtered),as.factor(true))
+
+conf.final.relaxed
+conf.final.stringent
+conf.final.relaxed
+
+```
+
+
+       
+       
+
