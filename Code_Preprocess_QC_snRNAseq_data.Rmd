@@ -1,0 +1,348 @@
+---
+title: "QC Single-cell Data"
+author: "Gilles Flamen"
+date: "`r format(Sys.time(), '%d %b %Y')`"
+output: 
+  BiocStyle::html_document: 
+    theme: spacelab 
+    number_sections: yes 
+    toc_float: yes 
+    toc_depth: 3
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+
+h1.title { 
+  text-align: center; 
+  margin-top: 60px; 
+  margin-bottom: 30px;
+}
+
+img + em { 
+  display: inherit; 
+  text-align: center; 
+  font-size: 8pt; 
+  color: #1a81c2; 
+  font-style: inherit; 
+  font-weight: bold; 
+}
+
+</style>
+```
+
+------------------------------------------------------------------------
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+
+# load data 
+
+## expression data
+
+Check script: GSE158724_LN.Rmd for code to load the data set 
+
+```{r single cell data, eval = T, warning=FALSE, message=FALSE}
+rm(list = ls())
+
+library(Seurat)
+library(data.table)
+
+load("GSE158724.raw.seurat.RData")
+
+class(GSE158724)
+
+dim(GSE158724)
+
+```
+
+## cell type data
+
+### from GEO
+
+```{r cell types}
+types <- read.table("GSE158724_10x.cell_types.txt", header = TRUE)
+
+dim(types)
+
+head(types)
+```
+
+
+### from supplementary files
+
+```{r, message=F,warning=F,error=F}
+library(tibble)
+library(tidyr)
+library(dplyr)
+
+cell.data <- read.csv("43018_2021_215_MOESM6_ESM.csv", header = TRUE)
+
+
+# make labels the same to check if they correspond
+cell.data$Cell.ID <- gsub(substring(cell.data$Cell.ID,1,4), "P",x = cell.data$Cell.ID)
+
+dim(cell.data)
+dim(types)
+
+# 110568 vs. 109319     
+# 1249 these cells no data in supplementary
+
+length(intersect(cell.data$Cell.ID,types$Cell))
+
+# all cells are cancer cells!!
+table(cell.data$Infercnv_CNA)
+table(cell.data$Celltype)
+
+# select A
+table(cell.data$ARM)
+
+# select 0
+table(cell.data$Day)
+
+# create cells.used
+cell.data %>% filter(cell.data$Day==0 & cell.data$ARM=="A") -> cells.used
+
+dim(cells.used)
+
+table(cells.used$dynamic_class3)
+
+# see how many responding samples in the data
+cells.used %>% filter(dynamic_class3=="Response") %>% select(Sample_p_t) %>% unique() -> temp.resp
+
+# see how many non-responders samples in the data
+cells.used %>% filter(dynamic_class3=="Non-response") %>% select(Sample_p_t) %>% unique() -> temp.non
+
+patient.data <- rbind(temp.resp, temp.non)
+
+patient.data$Sample_p_t <- substring(patient.data$Sample_p_t, 5,6)
+
+patient.data$response <- rep(c("Response","Non-response"),c(6,5))
+
+```
+
+We have 6 Response samples and 5 Non-response samples from the 11 in total! 
+
+# subset seurat for cells of interest
+
+```{r, eval = F}
+subset.seurat <- GSE158724
+
+subset.seurat <- subset(x = subset.seurat, cells = cells.used$Cell.ID)
+
+save(subset.seurat, file = "subset_seurat.RData")
+
+```
+
+
+
+```{r, message=F,warning=F,error=F}
+load(file = "subset_seurat.RData")
+```
+
+
+We subset the Seurat object for the cells of "armA" & "day 0". This reduced the cells from 110k to 21k. And we are left with 5 non-responders and 6 responders. Lets now do QC, filtering, normalizing, scaling, feature detection,...
+
+# QC
+
+```{r, message=F, warning=F, error=F, eval =T}
+pbmc <- subset.seurat
+ 
+# An object of class Seurat 
+# 21279 features across 21185 samples within 1 assay 
+# Active assay: RNA (21279 features, 0 variable features)
+
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA"), ncol = 1)
+VlnPlot(pbmc, features = c("nCount_RNA"), ncol = 1)
+VlnPlot(pbmc, features = c("percent.mt"), ncol = 1)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+# filter the data, in a stringent way!
+pbmc <- subset(pbmc, subset = nFeature_RNA > 1500 & nFeature_RNA < 7500 & percent.mt < 5 & nCount_RNA > 20)
+
+
+# visualise again after filtering
+# Visualize QC metrics as a violin plot
+
+VlnPlot(pbmc, features = c("nFeature_RNA"), ncol = 1)
+
+VlnPlot(pbmc, features = c("nCount_RNA"), ncol = 1)
+
+VlnPlot(pbmc, features = c("percent.mt"), ncol = 1)
+
+# Filter cells.used based on common Cell.ID with pbmc$orig.ident
+common_cells <- cells.used[cells.used$Cell.ID %in% names(pbmc$orig.ident), ]
+
+```
+
+We can see that the number of unique transcripts inside the cells differ much between patients, also the library size, which we define as the total sum of counts across all genes for each cell. F.e. patient 43 and P20 have big sizes compared to 15 & 16 with very small sizes. We can also depict this is table form. Mitochondrial-gene transcripts doesn't seem the form a problem, the paper itself put the threshold on 50%. 
+
+```{r}
+
+# table of unfiltered cells
+table(cells.used$Sample_p_t)
+
+# total cells
+sum(table(cells.used$Sample_p_t))
+
+
+# table of filtered cells
+table(pbmc$orig.ident)
+
+# total cells
+sum(table(pbmc$orig.ident))
+```
+
+The low counts come from patient 15, a resistant sample and patient 16, a sensitive sample. Also patient 29, a response sample, has worrying low counts. 
+
+The cells are reduced from 21185 to 19496
+
+## normalize and scale
+
+```{r ,message=F, warning=F, error=F, eval =T}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+# Identify the 20 most highly variable genes
+top2000 <- head(VariableFeatures(pbmc), 2000)
+top10 <- head(VariableFeatures(pbmc), 10)
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1))
+CombinePlots(plots = list(plot2))
+
+#scaling
+pbmc <- ScaleData(pbmc)
+
+```
+
+## dimension reduction 
+
+```{r, message=F, warning=F, error=F, eval =T}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc), )
+
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+# We can see on the scatter plot of the first two PC's that they cluster together based on from which patient the cells originate. Since only cancer cells are present in the data, no segregation according to cell type is expected.
+
+DimPlot(pbmc, reduction = "pca")
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+
+# Now we can clearly see that 10 dimensions captures most of the variability
+ElbowPlot(pbmc)
+
+# Let's cluster the cells 
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+
+
+```
+
+# save final object 
+
+load this object in the beginning when you dont want to load the pre-processing steps. 
+
+```{r, message=F, warning=F, error=F, eval =T}
+save(pbmc, file = "pbmc_final_object.RData")
+```
+
+```{r}
+load("pbmc_final_object.RData")
+pbmc
+```
+
+
+# feature plots 
+
+```{r, message=F, warning=F, error=F, eval =T}
+#plot features on top of cluster and cells
+FeaturePlot(object = pbmc, features = c("nCount_RNA"), pt.size = 2)
+FeaturePlot(object = pbmc, features = c("nFeature_RNA"), pt.size = 2)
+
+```
+
+
+```{r, message=F, warning=F, error=F, eval =T}
+DimPlot(pbmc, reduction = "umap", label=TRUE)
+
+#labeled clustered by samples (orig.ident)
+DimPlot(pbmc, reduction = "umap", group.by = "orig.ident", label=TRUE)
+
+# based on PCA
+DimPlot(pbmc, reduction = "pca", group.by= "orig.ident", label = TRUE)
+```
+
+We can see on the PCA that the clusters of cells are way less separated than on then UMAP based on patient. All the cells originate from cancerous cells, so gene expression is in some way similar, the separation in between clusters represents the patient variability. 
+
+Let's try subset the suerat object for only those cells that have expression in all 14 genes. 
+
+```{r, message=F, warning=F, error=F, eval =T}
+library(Seurat)
+
+seurat.validation <- pbmc
+
+
+seurat.validation[["response"]] <- common_cells$dynamic_class3
+
+Idents(object = seurat.validation) <- common_cells$dynamic_class3
+
+save(seurat.validation, file = "seurat_validation.RData")
+
+```
+
+# Pseudo bulk Sums
+
+here we created a pseudo bulk consisting of summing up the expression counts of all the cells for one gene per patient. We leave patient 15 and 16 out since they had very low number of cells.
+
+This data represents raw count data and can be TMM normalized and scaled to be used as validation data for the ML model.
+
+```{r}
+cells.used %>% select(Sample_p_t, dynamic_class3) %>% unique() -> row.ids
+
+row.ids
+
+exp.matrix <- as.matrix(subset.seurat@assays[["RNA"]]@counts)
+
+
+library(Matrix)
+sums.p14 <- rowSums(exp.matrix[,1:1611])
+#sums.p15 <- rowSums(exp.matrix[,1612:1654])
+#sums.p16 <- rowSums(exp.matrix[,1655:1696])
+sums.p20 <- rowSums(exp.matrix[,1697:5588])
+sums.p23 <- rowSums(exp.matrix[,5589:6959])
+sums.p28 <- rowSums(exp.matrix[,6960:9812])
+sums.p29 <- rowSums(exp.matrix[,9813:9955])
+sums.p41 <- rowSums(exp.matrix[,9956:16330])
+sums.p43 <- rowSums(exp.matrix[,16331:18195])
+sums.p44 <- rowSums(exp.matrix[,18196:20794])
+sums.p45 <- rowSums(exp.matrix[,20795:21185])
+
+
+
+sums.per.patients <- cbind(sums.p14,sums.p20,sums.p23,sums.p28,sums.p29,sums.p41,sums.p43,sums.p44,sums.p45)
+
+dim(sums.per.patients)
+
+head(sums.per.patients)
+
+save(sums.per.patients, file = "summed_pseudo_bulk.RData")
+```
